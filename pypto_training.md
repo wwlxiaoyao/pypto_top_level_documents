@@ -1773,7 +1773,220 @@ The fix is to **not materialize instances** the model never needed materialized.
 | Host builds once + one-shot copy + device autonomous (`host_build_graph`), **flat** `Task[]` | `O(1)` invalidate | safe | **can be GB** for unrolled tiled deep graphs (§59) | viable but memory-risky at scale |
 | **Host builds once + one-shot copy + device autonomous, *templated* + streamed (recommended)** | `O(1)` (or `O(#layers)` if streamed) invalidate | safe | **MB-scale**, `O(#task types)` | **recommended** — offloads AICPU, bus-safe, memory-bounded |
 
-## 61. Summary of Part 5 Decisions
+## 61. DSL Enhancement: Scoping Eager vs AOT (`pl.static` / `pl.dynamic`)
+
+The hybrid recommended in §8.7.4 and forced by §47.1 needs a **programmer-facing way to draw the line** between the dynamic chooser (stays eager) and the static body (gets captured / replayed / AOT). We expose it as **lexical scoping**, mirroring the existing `with pl.checkpoint()` (§6.3) and `with orch.scope()` constructs — the boundary the programmer marks *is* the capturable-region boundary of §49/§51.
+
+### 61.1 Two scope primitives + a decorator
+
+- **`with pl.static(...)`** — mark a region as an **AOT capturable region** (§49). Default-off: code is eager unless wrapped. First execution is captured, lowered, validated (§52), and prepared; matching subsequent executions **replay** (§50).
+- **`with pl.dynamic()`** — explicitly mark a region **eager** (define-by-run). Useful (a) for readability around the chooser and (b) as a **dynamic hole** nested inside a `pl.static` region (§61.3).
+- **Decorator forms** `@pl.static` / `@pl.dynamic` on a `pl.function` / orchestration function = wrapping the whole body.
+
+`pl.static(...)` arguments:
+
+| Arg | Meaning | Default |
+|-----|---------|---------|
+| `key=` | explicit replay-cache key | auto: `(region id, control-path id, live-in shapes/dtypes, parameter-set identity)` (§49.6, §53) |
+| `buckets=` | shape-bucketing policy for symbolic dims (§61.2) | none (fully static shapes) |
+| `guards=` | extra validity predicates | the auto topology-key guard |
+| `on_miss=` | cache miss / guard fail behavior | `"recapture"` (vs `"eager"`) — a graph break (§53) |
+
+### 61.2 Symbolic shapes — parametrize a static region instead of specializing it
+
+A static region whose only dynamism is **shape** should be captured **parametric** over that shape (the §60 template + iteration-space lever, surfaced in the DSL), not re-captured per value. Declare a symbolic dim with a bucket set:
+
+```python
+m = pl.symint("m_e", buckets=[64, 128, 256, 512])   # e.g. expert token count
+with pl.static(buckets="m_e"):
+    y = expert_mlp(tokens[:m], w_e)     # tiled into ceil(m / TILE_M) InCore tasks
+```
+
+The captured template is a function of `m` (loop bound `⌈m/TILE_M⌉` + affine binding); replay uses the realized `m` rounded up to its bucket (pad / mask the tail). One template covers a whole bucket → `O(#buckets)` variants, not `O(values)`.
+
+### 61.3 Composition rules
+
+- **Dynamic → static (the common, encouraged case).** An eager outer program calls into static regions; the outer loop / control flow stays eager, each static region replays. This *is* the §8.7.4 hybrid.
+- **A `pl.static` body must be topology-pure.** Its DAG must be a function of (declared symints + control-path), not arbitrary data-dependent branching. A data-dependent `if`/`while` on tensor *values* inside `pl.static` is a **compile error** unless wrapped in a dynamic hole.
+- **Static → dynamic "hole".** A `with pl.dynamic()` nested inside a static region is captured as an **opaque composite node** with a typed I/O signature — *not* a global barrier — and runs eagerly with a private local tensormap on each replay. The full splicing design (and why neither a tensormap-in-capture nor a global barrier is needed) is **§61.7**. Use sparingly — prefer hoisting the decision out to the eager outer level.
+
+### 61.4 Worked example: a DeepSeek-MoE layer (routing eager, experts static)
+
+```python
+@pl.function(differentiable=True)
+def moe_layer(self, x, gate_w, experts):
+    # ── dynamic: the router is data-dependent → stays eager ──────────────
+    with pl.dynamic():
+        idx, weights = top_k_gate(x, gate_w)          # which experts, per token
+        dispatch     = build_dispatch(idx)            # token → expert permutation
+        m            = pl.symint("m_e", buckets=EXPERT_CAPACITY)  # per-expert counts
+
+    ys = []
+    for e in range(N_EXPERTS):
+        tok_e = gather(x, dispatch, e)                # m_e tokens (a runtime value)
+        # ── static: each expert's compute is topology-pure given m_e ─────
+        with pl.static(buckets="m_e", key=("expert", e)):
+            ys.append(expert_mlp(tok_e[:m], experts[e]))   # replayed per bucket
+
+    # ── dynamic: combine depends on the routing again ───────────────────
+    with pl.dynamic():
+        return scatter_combine(ys, dispatch, weights)
+```
+
+Router and combine (data-dependent) are eager; each expert's MLP is a **static, `m_e`-parametric** region replayed from a small bucket cache. Cross-region dependencies (gathered tokens in, expert output out) are wired only at the region I/O surface (§51). This realizes §47.1 directly: the per-layer DAG difference is absorbed by the bucketed template, **not** by recompiling.
+
+### 61.5 What the runtime does at each scope (semantics)
+
+| Scope | First hit | Subsequent hit (key match) | Key miss / guard fail |
+|-------|-----------|----------------------------|------------------------|
+| `pl.dynamic()` (default) | eager build + execute | eager build + execute | n/a |
+| `pl.static()` | eager build + execute **and record**; lower + dual-pass validate (§52); prepare | **replay**: rebind live-in/out ptrs, seed ready queue, run job B (§50) | `on_miss`: recapture a new variant (default) or fall back eager |
+
+Guards are O(#region-IO) (§53); a static region reclaims as an arena unit (§51); for a parametric region the bucket is part of the key.
+
+### 61.6 Default policy and `pl.auto`
+
+A global default lets a team flip the whole model: `pl.set_capture_mode("eager" | "auto" | "static")`. `pl.auto` defers to **automatic region discovery** (§56 P5) — the runtime detects invariant-topology windows between epochs and captures them without annotations, using `pl.static` / `pl.dynamic` only as **overrides / hints**. So these scopes are the explicit front end now and the optimization target later: same scopes, optionally compiler-inferred.
+
+### 61.7 Dynamic holes in detail: splicing an eager sub-DAG into a static region without a barrier
+
+A dynamic hole is the hard case: inside a frozen, pre-wired static region we must run code that **builds its own DAG at runtime** — it needs a tensormap to infer dependencies among a *data-dependent number* of tasks. The question is how to splice that live sub-DAG into the replayed static DAG while (i) keeping the static region's precomputed-edge replay (§50) intact and (ii) avoiding an expensive global barrier. Three designs are possible.
+
+**Option A — capture the tensormap / integrate the hole's tasks into the static graph. Rejected.**
+This lets the hole's dynamically-created tasks wire edges directly to frozen static nodes via tensormap at replay. Two problems: (1) it re-introduces per-task tensormap into the otherwise tensormap-free static replay, partially defeating the point; (2) decisively, a static consumer downstream of the hole would have a **dynamic-cardinality fan-in** — its `fanin_count` cannot be precomputed at capture because the hole emits a variable number of producer tasks. That breaks the "all fan-in counts precomputed, seed sources into the ready queue" replay model (§50). To make the static side precomputable again you must collapse the hole's output to a *fixed* producer surface — which **is** Option B. So pure integration is not viable, and **we do not capture the hole's internal tensormap**.
+
+**Option C — global barrier before and after the hole. Rejected except as a last-resort fallback.**
+Drain all in-flight work, run the hole, drain again, resume. Correct, but it **over-synchronizes**: every static task — even those with no dependency on the hole — is stalled, and the cross-hole pipeline overlap (the whole point of the ring) is destroyed. Cost ≈ O(all in-flight tasks) of idle, paid **twice**. Reserve it only for when live-outs cannot be statically enumerated or the hole aliases static-internal buffers unpredictably.
+
+**Option B — opaque composite node with a fixed I/O surface; eager inside, static outside. Recommended.**
+Model the hole as a **single composite node** in the static plan carrying a **statically-known I/O signature**: a fixed set of **live-in** tensors (read) and a fixed, small set of **live-out ports** (written). Frozen vs. live:
+
+| Frozen at capture (in the static artifact) | Live / rebuilt each replay (private to the hole) |
+|---|---|
+| the hole's slot in the static plan; its **live-in set** and **live-out ports**; the boundary edges `static-producer → hole` and `hole-port → static-consumer`; downstream `fanin_count`s (the hole counts as **one** producer per port) | the hole's **internal sub-DAG**, built eagerly with a **private, local tensormap + local ring/scope**, torn down at hole exit |
+
+Mechanics — all reusing existing `simpler` machinery:
+
+- **Boundary in.** Live-ins are a fixed set, so `static-producer → hole` are ordinary **frozen fan-in edges**. The hole does not begin internal work until its live-ins are ready — a normal data dependency, **not a barrier**; unrelated static tasks proceed concurrently.
+- **Inside.** The hole runs as a **nested scope / sub-orchestration** with its own tensormap and ring — exactly `simpler`'s nested-scope / recursive-`Worker` composition. That tensormap is **local** and never enters the AOT capture, so it cannot pollute the static edges.
+- **Boundary out / completion.** The hole node **completes when its internal sub-DAG drains** and its live-out ports are materialized; only then does its fan-out fire, releasing **only** the static consumers of those ports. This is the same completion-gating `simpler` already does for **group tasks** (`on_task_complete` gated on `sub_complete_count == group_size`): a composite that signals done once. Only the hole's transitive consumers wait; the rest of the static region overlaps freely — a **localized join**, not a global drain.
+- **Output ports (avoid coarse over-join).** Modeling the hole as **k fixed output ports** (k known at capture) instead of one lets independent live-outs release their consumers **as each port completes**, recovering most of the otherwise-lost overlap while keeping static fan-in counts precomputed (k is static; only the internal task count is dynamic).
+
+**Direct answers to the sub-questions:**
+
+- *Include tensormap in the AOT capture?* **No.** Capture the hole's **I/O contract** (live-ins, k live-out ports, boundary edges), not its internal tensormap. The tensormap is reconstructed live inside the hole each replay and discarded — eager inside, static outside.
+- *Does it create problems for the subsequent static DAG?* **No**, precisely because the hole presents a **fixed producer surface** (k ports). Downstream static consumers see a constant number of producer edges, so their `fanin_count` stays precomputed; the hole's internal cardinality is invisible to them.
+- *Track fan-in/out of the whole hole and resolve after it completes?* **Yes — that is Option B**, refined with k ports so partial results release early.
+- *Global barrier?* **Not needed** in the common case; it is only the degenerate fallback when live-outs are not statically enumerable.
+
+**Memory & guard.** The hole owns a **region-arena scope** (§15, §51) reclaimed as a unit at exit, so its transient internals never perturb the static region's frozen memory plan; live-outs land in the pre-reserved port buffers the static consumers address. The hole's **I/O signature (shapes of live-ins / ports) is part of the enclosing region's topology key** (§53): if those boundary shapes change, the enclosing static region takes a guard miss and re-captures the boundary — but the hole's **internal** dynamism (variable task count) **never** triggers a re-capture. That is the exact separation the hybrid needs: dynamism is free *inside* the hole and *outside* the static region, and only the **thin I/O contract** between them is frozen.
+
+### 61.8 Picture: the nested static / dynamic DAG
+
+Three nesting levels: an **eager outer** orchestration (the data-dependent chooser), a **`pl.static` region** replayed from frozen explicit edges, and — inside it — a **`pl.dynamic` hole** that the static plan sees as **one composite node** (live-in ports in, `k` live-out ports out) but that runs eagerly with a private tensormap.
+
+```mermaid
+flowchart TB
+  IN([model input])
+  OUT([model output])
+
+  subgraph DYN_OUT["pl.dynamic — OUTER orchestration (eager, define-by-run; tensormap live)"]
+    CH["router / chooser<br/>(data-dependent)"]
+
+    subgraph STAT["pl.static REGION — captured once, replayed (explicit FROZEN edges, no tensormap)"]
+      S1["S1"]
+      S2["S2"]
+      S4["S4"]
+      S3["S3"]
+
+      subgraph HOLE["pl.dynamic HOLE = ONE composite node (eager inside, LOCAL tensormap)"]
+        LI["live-in ports"]
+        H1["h1"]
+        H2["h2"]
+        Hk["h… (variable #tasks)"]
+        LO["k live-out ports"]
+        LI --> H1 --> LO
+        LI --> H2 --> LO
+        LI --> Hk --> LO
+      end
+
+      S1 --> S2
+      S2 -->|frozen fan-in edge| LI
+      S2 --> S4
+      LO -->|fires once hole sub-DAG drains| S3
+      S4 --> S3
+    end
+  end
+
+  IN --> CH --> S1
+  S3 --> OUT
+```
+
+**Legend / reading the picture.**
+
+- **Outer box (`pl.dynamic`)** — eager, define-by-run; the chooser/router lives here and decides *which* static region (and which bucket) to invoke. Full tensormap, full dynamism.
+- **Middle box (`pl.static`)** — `S1…S4` are frozen InCore nodes wired by **explicit captured edges**; replay seeds sources into the ready queue and runs job B with **no tensormap, no per-task wiring** (§50).
+- **Inner box (`pl.dynamic` hole)** — collapses, *as the static planner sees it*, to a **single composite node** with a fixed **live-in set** and **`k` live-out ports**. `S2 → live-in` is a normal **frozen fan-in** edge (no global barrier); `live-out → S3` fires **once, when the hole's internal sub-DAG drains** (group-task completion gating, §61.7). `S4` (independent of the hole) overlaps the hole freely — *not* stalled.
+- **Inside the hole** — `h1, h2, h…` are built eagerly each replay via a **local tensormap + local ring/scope**; their **count is data-dependent** and **invisible** to `S3` (which only ever sees the `k` ports).
+
+What the **static artifact actually freezes** (the hole is one node with ports; internals are absent):
+
+```text
+            ┌──────────────────── pl.static REGION (frozen) ───────────────────┐
+   input ─► │  S1 ─► S2 ─┬──────────────────────────────► S4 ──┐               │
+            │            │  (frozen fan-in)                      ▼               │
+            │            └─►┌───────────────┐ k ports ────────► S3 ─► region    │
+            │               │   HOLE  node  │  (fires once          live-out ─► │ ─► output
+            │               │  live-in ▸▸   │   hole drains)                     │
+            │               └───────────────┘                                   │
+            │                 ▲ eager inside: local tensormap builds a           │
+            │                   variable sub-DAG (h1,h2,h…), torn down at exit   │
+            └───────────────────────────────────────────────────────────────────┘
+   FROZEN: S1..S4 + edges + the HOLE's slot, live-in set, k ports, boundary edges, fan-in counts
+   LIVE  : the HOLE's internal sub-DAG + its local tensormap (never captured)
+```
+
+Mapped to the MoE example (§61.4): the **outer `pl.dynamic`** is `top_k_gate` / `build_dispatch` / `scatter_combine`; each **`pl.static` region** is an expert's `expert_mlp` (parametric over the `m_e` bucket); a hole would appear only if an expert's body itself contained data-dependent control flow (uncommon — experts are dense GEMMs, so they are pure static regions with no hole).
+
+### 61.9 Placement: top level on the host CPU, the dynamic hole on the AICPU
+
+**Yes — and it is the recommended placement.** It is exactly the composition of §58 (host *builds*, device *executes*, bridged by one one-shot copy) with §61.7 (the hole is a device-local eager sub-orchestrator). Each level lands where its work is cheap and its data is coherent:
+
+| Level | Runs on | Why there | Host↔device bus crossing |
+|-------|---------|-----------|--------------------------|
+| **Top `pl.dynamic` chooser** (job A: build the outer graph, pick region/bucket) | **Host CPU** | data-dependent control flow + builds the static region's `Task[]`; plentiful CPU, coherent host RAM (§57–§58) | emits **one** one-shot DMA + **one** `cache_invalidate_range` per region launch |
+| **`pl.static` region — build** (job A) | **Host CPU** | big graph built once into the frozen, templated artifact (§59–§60) | part of that same one-shot copy |
+| **`pl.static` region — execute** (job B: fan-in / dispatch / completion) | **AICPU + AICore** | descriptor execution inside the coherent AICPU↔AICore domain; runs autonomously after the copy (§58) | **none** (post-copy) |
+| **`pl.dynamic` hole** (job A *and* B: live tensormap build + dispatch) | **AICPU + AICore** | its live-ins are **device-resident**; needs a **coherent** tensormap; it is small + frequent and must interleave with the region's device execution | **none** (fully device-local) |
+
+**Why the hole belongs on the AICPU, not the host.** The hole sits *inside* a region that is already executing on the device. Building it on the host would force a **mid-region host round-trip** at every hole encounter: pause device execution, ship live-in metadata host-ward, host builds the sub-DAG, one-shot copy it back, resume — i.e. re-introducing per-encounter cross-bus synchronization (and device idle) that §57–§58 spent all their effort eliminating. Running the hole on the AICPU keeps the whole thing device-local: the AICPU reads the hole's device-resident live-ins from **coherent** GM, builds its sub-DAG with a **local** tensormap (this is precisely what the existing `tensormap_and_ringbuffer` PTO2 AICPU orchestrator already does), and dispatches to AICore in the same snoop domain — **no bus crossing per task**. Because the hole is deliberately small (§61.3), the AICPU cost it re-consumes is bounded, which preserves the whole point of offloading the *bulk* (the static build) to the host.
+
+**The clean split, in one line:** the host pays the host↔device non-coherency cost **exactly once per region** (the one-shot copy), absorbs the big static build, and makes the coarse data-dependent decisions; the AICPU is left with cheap frozen-descriptor execution **plus** the small, latency-sensitive, device-resident dynamic hole where on-device locality is essential.
+
+```text
+        HOST CPU (coherent host RAM, plentiful)        │   DEVICE  (AICPU ↔ AICore: coherent GM)
+        ──────────────────────────────────────         │   ────────────────────────────────────
+  pl.dynamic OUTER chooser ── builds region ──►  one-shot DMA + 1× cache_invalidate_range
+        (job A, data-dependent)                         │        │
+                                                        │        ▼
+                                                        │   pl.static REGION — AICPU replays frozen Task[],
+                                                        │        │              AICore runs kernels        (job B, device-local)
+                                                        │        │  reaches HOLE composite node
+                                                        │        ▼
+                                                        │   pl.dynamic HOLE — AICPU PTO2 eager-builds via
+                                                        │        │              LOCAL tensormap → AICore   (job A+B, device-local)
+                                                        │        ▼
+                                                        │   resume frozen descriptors → region live-out
+   ◄───────────────── region done (one completion signal) ──────┘
+```
+
+**Implementation note (one runtime, two modes — not two `.so`s).** The AICPU must, within a single region execution, both **replay frozen descriptors** (the `host_build_graph` executor) and **eager-build holes** (the `tensormap_and_ringbuffer` orchestrator), switching by node type. These must be **unified in one runtime `.so` on the main `aicpu_scheduler` cluster (Path A)** — *not* two separate runtime `.so`s coordinated via the cust subprocess (Path B), which falls outside AICore's snoop domain and dead-spins on stale HBM (the #822 coherency trap). Staying on the main cluster keeps every device-side read coherent.
+
+**When the opposite placement is acceptable.** If a hole is **rare and large** (encountered once per many steps, big sub-DAG), host-build + one-shot copy can win — the round-trip amortizes and the host CPU is cheaper. The common nested hole (small + frequent) is the AICPU case. This is just the §52 break-even logic applied to the hole. Conceptually the AICPU hole is a **nested device-local orchestrator inside a host-driven static region** — the same recursive Orchestrator/Scheduler/Worker composition `simpler` already uses across levels (§9 task-flow recursion), here split across the host↔device boundary.
+
+---
+
+## 62. Summary of Part 5 Decisions
 
 1. **Removing Python ≠ removing dynamic construction.** The codegen'd C++/AICPU orchestrator is still a define-by-run interpreter that re-derives the same DAG every step (TensorMap hashing, ring alloc, scheduler wiring, cross-thread hand-off). For inference decode this is pure redundancy.
 2. **Don't fully AOT-compile free control flow** (undecidable / requires tracing all branches). Instead **capture the realized DAG once and replay it** — the orchestration-layer CUDA-Graph, and the natural extension of the §8.1 *job A (build) vs job B (execute)* split: replay kills job A's per-step cost, job B is reused verbatim.
@@ -1785,3 +1998,6 @@ The fix is to **not materialize instances** the model never needed materialized.
 8. **Offloading the orchestrator to the host is the right answer to AICPU scarcity — but only as build-once / execute-autonomously.** Host-written GM is **not coherent** with the AICPU cache (one `dsb sy`-dominated `cache_invalidate_range` per host-published read), and cross-bus spin/atomics are not just slow but **unsafe** (#822). A host scheduler coordinating device tasks per edge is therefore **rejected**.
 9. **The viable coupling is the job-A/job-B seam taken to the bus:** build the graph on the host (job A, `host_build_graph`), execute it on the device inside the coherent AICPU↔AICore domain (job B), bridged by a **single one-shot DMA + one `cache_invalidate_range`** — turning `O(#tasks×#edges)` cross-bus invalidates into `O(1)`.
 10. **The one-shot graph's memory is bounded by keeping the schedule templated, not unrolled.** A flat `Task[]` for a tiled, deep, long-context model can reach GB-scale (InCore tiling × layers); a **parametric template + iteration space + affine binding** makes resident size `O(#task types)` (MB-scale, expanded on-device by index arithmetic), with **streamed per-layer double-buffered copy** as the fallback. This is the *same* artifact as the capture/replay region — host-offload and per-step-overhead elimination are one mechanism.
+11. **The eager/AOT boundary is programmer-scoped in the DSL** via `with pl.static()` (capturable/replayed) vs `with pl.dynamic()` (eager), plus `pl.symint(..., buckets=...)` to capture shape-dynamic regions **parametrically** (e.g. MoE `m_e`). Static bodies must be topology-pure; data-dependent control flow lives in `pl.dynamic` (the chooser) or a nested dynamic hole. `pl.auto` / `pl.set_capture_mode` allow a global default and a path to compiler-inferred regions (§56 P5) — the marked scopes are both today's front end and tomorrow's optimization target.
+12. **A dynamic hole inside a static region is an opaque composite node, not a barrier** (§61.7): fixed live-in set + `k` live-out ports are frozen into the static artifact; the hole's internal sub-DAG is built eagerly each replay with a **private local tensormap** (never captured) and signals completion once (group-task gating), so only its real consumers wait while independent static work overlaps. Neither tensormap-in-capture nor a global barrier is needed.
+13. **Recommended placement maps the nesting onto the hardware** (§61.9): the **top dynamic chooser + the static build run on the host CPU** (one one-shot copy per region launch), the **static region executes on AICPU+AICore**, and the **dynamic hole runs on the AICPU** (device-local eager build via the PTO2 tensormap, no mid-region host round-trip). Unify replay + eager-build in **one runtime `.so` on the main `aicpu_scheduler` cluster** (Path A), never the cust subprocess (Path B / #822 coherency trap).
