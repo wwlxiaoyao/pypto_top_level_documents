@@ -2034,7 +2034,200 @@ The decisive property: **the device scheduler is data-agnostic.** It moves slot 
 
 - **Coexistence** = shared queues + shared slot pool + shared loop.
 - **Isolation** = the hole's private tensormap + private ring layer (logical, *not* a second scheduler).
-- **Completion gating (the hole as one producer).** The `ORCH` builder returns after *submitting* the sub-DAG, but the hole's **fan-out to static consumers must not fire until the sub-DAG's live-outs are produced.** Realize this with the **nested-scope drain** `simpler` already has: the builder opens the hole scope, submits into it, and the hole's `k` live-out ports become "ready" only when that scope **drains** (its live-out producer slots reach COMPLETED) — the same composite-completion gating as group tasks (`sub_complete_count == group_size`). Static consumers therefore see the hole as a **single producer that completes once**, preserving their precomputed fan-in (§61.7).
+- **Completion gating (the hole as a deferred producer).** The `ORCH` builder returns after *submitting* the sub-DAG, but the hole's **fan-out to static consumers must not fire until the sub-DAG's live-outs are produced.** Realize this by **decoupling builder-return from logical completion** and gating each of the `k` live-out ports on **its own dynamic producers completing** — the same composite-completion machinery as group tasks (`sub_complete_count == group_size`), generalized to a runtime-bound producer set. Each port releases its static consumers **independently as it finishes** (per-port partial release), and the hole scope reclaims once all ports drain. The full spawn/join design (entry slot + `k` hybrid exit/port slots, vs. the blocking-drain fallback) is **§62.4.3**.
+
+#### 62.4.1 What `wiring_queue` is — and why static slots bypass it while dynamic slots flow through it
+
+The scheduler owns three queues — **`wiring_queue` → `ready_queue` → `completion_queue`** — corresponding to its three phases. `wiring_queue` is the channel from the **builder (orchestrator)** to the **scheduler**, carrying a newly-submitted consumer plus the producers it depends on:
+
+```cpp
+struct WiringEntry { TaskSlot consumer; std::vector<TaskSlot> producers; };
+LockFreeQueue<WiringEntry> wiring_queue_;   // producer: submit_*;  consumer: Scheduler Phase 0
+```
+
+**Why it exists.** `submit_*` knows only the *forward* relation (consumer → its producers, from tensormap lookups). Building the graph also needs the *reverse* edge installed on **each producer's** slot (its fanout list), which requires that producer's `fanout_mu` — the very lock the scheduler thread takes when it releases fanout on completion (Phase 2). Doing it synchronously inside `submit` would contend with the scheduler. So `submit` just **lock-free-enqueues** a `WiringEntry`, and the scheduler does the actual "wiring" in **Phase 0** (`wire_fanout`): for each live producer, push the consumer onto `producer.fanout_consumers` and bump `fanout_total`; set `consumer.fanin_count` to the count of producers **not yet COMPLETED** (handling the submit-vs-complete race); if that count is 0, promote the consumer straight to `ready_queue`.
+
+**Static bypasses it; dynamic flows through it.**
+
+| | Edges | Goes through `wiring_queue`? | How it reaches `ready_queue` |
+|---|-------|------------------------------|------------------------------|
+| **Static slots** | resolved + frozen at capture (§50) | **No** — fanout lists and `fanin_count`s are pre-installed at load | sources (`fanin_count == 0`) are **seeded directly**; others promote as producers complete |
+| **Dynamic slots (hole)** | derived live by the `ORCH` builder's private tensormap | **Yes** — each `submit_*` enqueues a `WiringEntry` | Phase-0 wires them, then promotes the ready ones |
+
+#### 62.4.2 Does the scheduler see both graphs and dispatch whichever becomes ready? — Yes
+
+There is **no "static-graph object" vs "dynamic-graph object"** in the scheduler — only **one slot pool** and **one set of queues**, and readiness is purely `fanin_released == fanin_count`. Consequences:
+
+- **One `ready_queue` (per core-type bucket: AIC / AIV / MIX) holds the ready slots of *both* populations.** Phase-1 dispatch pops by **readiness, not by origin**: if a static `S4` and a hole-internal `h1` are both ready, both sit in the ready queue and **both dispatch** as soon as an AIC/AIV worker is free — i.e. the static region's hole-independent work and the hole's internal kernels **run concurrently** (the no-barrier overlap of §61.7).
+- **Cross-graph edges exist only at the hole boundary and use the same fan-in mechanism:** a static producer completing releases the `ORCH` task's fan-in (live-in); the hole scope draining releases the static consumers' fan-in (live-out ports). No special "switch graphs" path — readiness propagates across the boundary exactly as within either graph.
+- **Phase-2 completion is uniform too:** any completed slot releases its fanout and is reclaimed — dynamic slots into the hole's private ring, static slots per the frozen plan.
+
+In one line: **whichever task's fan-in clears first enters `ready_queue` first and dispatches first**, regardless of which graph produced it; isolation lives only in the tensormap and ring (scope), never in how the scheduler decides readiness or dispatch.
+
+#### 62.4.3 Determining when the dynamic subgraph is done — the spawn / join design
+
+**The problem.** The `ORCH` builder slot is dispatched, *builds* the sub-DAG, and **returns immediately** — but the subgraph's tasks are still pending/executing. If the hole fired its fan-out to static consumers at builder-return (the normal "worker returned → COMPLETED → release fanout" rule), consumers would start before the live-outs exist. The hole's fan-out must be **deferred until the subgraph's live-out producers complete.** This is a **spawn/join** problem, and yes — it needs a small, specific design (though **no new scheduler primitive**).
+
+**Two designs.**
+
+- **(A) Blocking drain on the `ORCH` worker.** The builder opens the hole scope, submits the sub-DAG, calls `drain()` (blocks until the scope's `active_tasks == 0`), then returns → normal completion fires the fan-out. Simplest (pure reuse of scope/drain) but it **parks a scarce AICPU worker** for the whole subgraph duration. Acceptable as a v1 fallback; **not** the target.
+- **(B) Asynchronous join via exit/port slots (recommended).** Represent the hole at the boundary as an **entry slot + `k` exit/port join slots** (not a single node):
+
+  | Boundary slot | fan-in | fan-out | completes when |
+  |---------------|--------|---------|----------------|
+  | **entry = `ORCH` builder** | static **live-in** producers (frozen) | the sub-DAG it spawns (it does **not** feed static consumers) | builder returns — **early**, decoupled from the hole's logical completion |
+  | **exit = `k` port join slots** | the subgraph's **live-out producers**, **late-bound at runtime** by the builder (via the private tensormap, through the normal `wiring_queue`/Phase-0 path) | the static consumers of that port (**frozen** at capture) | that port's dynamic producers all reach COMPLETED |
+
+  So **subgraph completion is decided by an exit slot's fan-in clearing** — expressed entirely with the existing fan-in/fan-out machinery: asynchronous (no worker parked), and **per-port** (independent live-outs release their consumers as each port finishes, the §61.7 partial-release). It is exactly `simpler`'s group-task gating (`sub_complete_count == group_size`) generalized from "wait for N fixed sub-tasks" to "wait for a **dynamic set** of producers."
+
+**What is genuinely special (all small):**
+
+1. **Reserved boundary slots** — the static plan reserves the entry + `k` exit slots per hole; static consumers' frozen edges target the exit ports.
+2. **Entry completes early and is decoupled** — the `ORCH` builder slot reaching COMPLETED must **not** release static consumers (the exit slots do).
+3. **Exit slots are "hybrid": dynamic fan-in + frozen fan-out** — their `fanin_count` is unknown at capture and filled in at runtime by the builder (the only late-bound piece; it uses the same Phase-0 wiring as any dynamic slot), while their fan-out to static consumers was frozen at capture.
+
+**Edge cases.**
+
+- **Zero-producer port** (data-dependent: a port gets no producer this run) → its exit slot's `fanin_count == 0` → fires immediately. Correct, but the builder must ensure the port buffer holds a defined value (fill/zero) so consumers don't read garbage.
+- **Reclamation** — once all `k` exit slots complete and the subgraph drains, the hole scope drains and its private ring reclaims as a unit (normal scope mechanism).
+- **Nested holes** — an exit slot may itself be a deeper hole's entry; the design recurses.
+- **Ordering** — entry COMPLETED (early) and exit COMPLETED (late) are independent slot transitions; the scheduler handles both as ordinary slots, with **no "wait-for-builder" special path**.
+
+**Picture: entry slot, exit/port slots, and the builder-injected dynamic tasks.** Solid arrows are *frozen* edges (in the static artifact); dashed arrows are *late-bound* edges the `ORCH` builder wires at runtime through the `wiring_queue`. The boxes inside the dotted scope are the data-dependent task count the static side never sees.
+
+```text
+        STATIC (frozen plan)                          DYNAMIC (built at runtime, private scope)
+  ───────────────────────────────────        ─────────────────────────────────────────────────────
+
+   live-in producers                            ........ hole scope (private tensormap + ring layer) ........
+     ┌──────┐                                   :                                                          :
+     │  S2  │──────frozen fan-in───────►┌───────────────┐  submit_* injects sub-DAG  ┌────┐                :
+     └──────┘                           │  ENTRY slot   │───────────────────────────►│ d1 │──┐             :
+     ┌──────┐                           │ = ORCH builder│            ┌────┐          └────┘  │             :
+     │  S2' │──────frozen fan-in───────►│  (early-done) │───────────►│ d2 │───┐      ┌────┐  ├──►┌──────┐  :
+     └──────┘                           └───────────────┘            └────┘   │      │ d4 │──┤   │live- │  :
+                                          completes on RETURN         ┌────┐  ├─────►│    │  │   │out p0│··┼·· producers
+                                          (does NOT feed S3/S5)       │ d3 │──┘      └────┘  │   └──────┘  :   of port 0
+                                                                      └────┘                 └──►┌──────┐  :
+                                                                       (count is data-dependent) │live- │··┼·· producers
+                                                                                                 │out p1│  :   of port 1
+                                                                                                 └──────┘  :
+                                                                       .....................................
+                                                                                                 │     │
+                                       k EXIT / PORT slots (reserved in the static plan)          │     │
+                                          ┌───────────────┐                                       │     │
+   static consumers    ◄──frozen fanout───│  PORT-0 slot  │◄········ late-bound fan-in (dyn) ······┘     │
+     ┌──────┐                             │ done when its │                                             │
+     │  S3  │◄────────────────────────────│ dyn producers │                                             │
+     └──────┘                             │ all COMPLETED │                                             │
+     ┌──────┐                             └───────────────┘                                             │
+     │  S5  │◄──frozen fanout──┐          ┌───────────────┐                                             │
+     └──────┘                  └──────────│  PORT-1 slot  │◄········ late-bound fan-in (dyn) ············┘
+                                          │ (independent  │
+                                          │ partial join) │
+                                          └───────────────┘
+```
+
+Reading it: `S2/S2'` (frozen) release the **ENTRY** slot; the builder runs, `submit_*`-injects `d1..d4` (data-dependent count) into its private scope, then **returns and completes early** — it never touches `S3/S5`. The live-out producers of each port are wired (dashed) into the corresponding **PORT slot**; each PORT slot completes by ordinary fan-in (`fanin_released == fanin_count`) and then fires its **frozen** fan-out to the static consumers (`PORT-0 → S3`, `PORT-1 → S5`). `PORT-0` and `PORT-1` join **independently**, so `S3` need not wait for `S5`'s producers.
+
+### 62.4.4 Front end: is `pl.dynamic` enough, and how are the hole's fan-in / fan-out determined?
+
+**Is `with pl.dynamic()` alone sufficient to specify the sub-orchestration?** For the **outer** eager region (the chooser, §61.1) — yes, a bare `with pl.dynamic():` is enough, because nothing downstream is frozen: it is define-by-run end to end. For a **hole nested inside `pl.static`** — `pl.dynamic()` marks *where* the eager region is, but it is **not by itself a complete spec**, because the static planner must reserve the **entry slot + `k` exit/port slots** and freeze the boundary edges (§62.4.3). What is missing is the **I/O contract**: the live-in set and the number/identity of live-out ports. There are two ways to supply it, and PyPTO uses the first by default:
+
+**(1) Inferred from the capture trace (default — no extra syntax).** The hole is a **lexical scope**, so the front end already has SSA def/use information at capture time. The contract is pure **boundary data-flow analysis** (the same "boundary-only re-derivation" of §51):
+
+- **Fan-in (live-in) = SSA values defined *outside* the hole and *used inside* it.** These are exactly the tensors the dynamic body reads that some static producer wrote. The front end collects them and emits the frozen `static-producer → ENTRY` edges. (`x`, `dispatch` in the MoE body would be live-ins.)
+- **Fan-out (live-out ports) = SSA values defined *inside* the hole and *used outside* it (downstream in the static region).** The **count of such distinct values is `k`** — known at capture even though the *number of tasks producing them* is not. Each becomes a reserved PORT slot whose frozen fan-out is the set of static consumers that reference it.
+
+So the front end determines fan-in/fan-out **by lexical liveness across the `pl.dynamic` boundary**, not by tracing the hole's internal tasks — which is precisely why the internal task count can stay dynamic while the boundary stays frozen.
+
+**(2) Declared explicitly (opt-in, for when inference is ambiguous).** When the live-out set cannot be statically enumerated (e.g. the hole writes into a buffer chosen at runtime, or aliases a static-internal tensor), the programmer pins the contract:
+
+```python
+with pl.dynamic(live_in=[x, dispatch], out_ports=2) as hole:
+    ...                              # data-dependent number of tasks
+    hole.port[0] = combine_a(...)    # binds live-out port 0
+    hole.port[1] = combine_b(...)    # binds live-out port 1
+```
+
+`live_in` fixes the frozen in-edges; `out_ports=k` fixes the reserved exit slots; `hole.port[i] = t` is the DSL seam that tells the runtime *which* dynamic producer feeds port `i` (this is the late-binding the builder performs through the `wiring_queue`, §62.4.3). If neither inference nor an explicit contract can bound `k`, the region degrades to the **global-barrier fallback** (§61.7 Option C) — correct but non-overlapping.
+
+**What the front end emits per hole (either path):** an `ENTRY` `ORCH` slot (frozen fan-in = inferred/declared live-ins; spawn-only, early-complete), `k` reserved `PORT` slots (frozen fan-out = the static consumers of each port; fan-in late-bound at runtime), and the hole's I/O **shapes** folded into the enclosing region's **topology key** (§53) — so a boundary-shape change re-captures the boundary, while internal dynamism never does.
+
+**Recommendation: support both, default to inference, allow explicit override.** The two paths are not alternatives to choose between — they emit the **identical artifact** (ENTRY + `k` PORT slots + topology key), so supporting both costs almost no extra mechanism: declaration merely *replaces or constrains* the inference step; the scheduler, completion gating, and replay are unchanged. The reasons not to pick only one:
+
+- **Inference alone is insufficient.** It holds only when the live-out set is **lexically SSA-determinable**. When the hole writes a runtime-chosen buffer, **aliases** a static-internal tensor, has a **data-dependent port count `k`**, or hides `submit`s behind helper layers, the front end **cannot bound `k`** — pure inference then misfires or collapses the whole region to the §61.7 Option C barrier (losing overlap). Explicit declaration is the precise escape hatch for exactly these cases.
+- **Declaration alone is too heavy.** Forcing `live_in=[...] / out_ports=k / hole.port[i]=` on **every** hole burdens the common case (e.g. MoE, where the boundary is obvious) with boilerplate and error surface, defeating the "dynamism is free inside the hole" goal.
+
+**Layered policy (the resolution order the front end applies):**
+
+1. **Default — infer** the contract from boundary liveness (no syntax).
+2. **Inference OK but programmer pins it — explicit declaration *overrides*,** and is **cross-checked** at capture: if declaration disagrees with inference, it is a **compile error** (the declaration doubles as machine-checked documentation).
+3. **Inference cannot bound `k` — *require* explicit declaration** (a compile error that asks for `out_ports=` / `hole.port[i]=`), rather than silently degrading.
+4. **Explicit declaration still cannot bound `k` — fall back to the Option C global barrier** (§61.7): correct, non-overlapping, last resort.
+
+So the front end is **inference-first with a declared override**, and the barrier is reserved for the genuinely non-enumerable tail — dynamism stays free inside the hole in the common case, while the hard cases remain expressible and bus-safe.
+
+#### 62.4.5 When does inference fail (cannot bound `k`)?
+
+Inference works only when the hole's **live-out set is uniquely, statically determinable from lexical SSA def/use across the `pl.dynamic` boundary** — i.e. "which values are defined inside the hole and used outside" is a fixed, enumerable set, each with an unambiguous producer binding. The following classes break that premise (grouped by root cause); the first column is what defeats the analysis.
+
+**1. The port count `k` is itself data-dependent (count-dynamic).** The *number* of live-outs depends on runtime data, not lexical structure.
+
+```python
+with pl.dynamic():
+    outs = []
+    for g in active_groups(x):      # len(active_groups) known only at runtime
+        outs.append(work(g))
+    return scatter(outs)            # #escaping values = len(active_groups) — not static
+```
+
+SSA sees only one name `outs`; it cannot count `k`. `pl.symint`/buckets fix *shape* dynamism, not **port cardinality** dynamism.
+
+**2. Runtime-chosen output buffer / container slot (dynamic indexing).** *Which* value escapes depends on a runtime index, so the producer→port binding is not unique.
+
+```python
+with pl.dynamic():
+    slot = pick(x)                  # 0..N-1, chosen at runtime
+    bufs[slot] = compute(x)         # which bufs[i] escapes?
+    return bufs
+```
+
+The def/use crosses the boundary, but the front end cannot pin a specific dynamic task to a specific reserved PORT slot.
+
+**3. Aliasing / in-place write of a static-internal tensor.** The hole mutates a buffer that is *also* static-internal, so the escaping thing is a side effect on an existing tensor, not a clean new SSA value.
+
+```python
+with pl.dynamic():
+    accumulate_into(static_buf, x)  # writes a tensor the static side already owns
+```
+
+Boundary liveness sees no new value, and the static side's `fanin_count` for `static_buf` acquires an unmodeled version dependency on the hole's write (the same hazard that rejected §61.7 Option A).
+
+**4. Escape across an abstraction layer / mutable container.** The `submit`/assignment happens inside a helper, a closure, or via a stash-then-fetch — bounding it needs **interprocedural escape analysis**, which the default (intraprocedural) inference does not do.
+
+```python
+with pl.dynamic():
+    ctx.stash("y", build(x))        # stored into a runtime container
+...
+z = ctx.fetch("y")                  # read outside — lexically, y's escape is invisible
+```
+
+**5. Path-dependent liveness (control-flow-dependent escape).** Different branches escape *different* values / producers, or a port may exist only on some paths (the §62.4.3 zero-producer port is the degenerate special case).
+
+```python
+with pl.dynamic():
+    if route(x):  y = path_a(x)
+    else:         y = path_b(x)     # k=1 still inferable
+    if rare(x):   extra = side(x)   # extra exists only sometimes → optional port
+    return combine(y, extra?)
+```
+
+The live-out *set* varies with the path; it is not a single static set, so inference either misses ports or must explode each path into its own topology key.
+
+**6. Outputs that are side effects, not returned values.** The output is a collective, a GM write, or external-state mutation — there is no downstream-referenced SSA value, so the liveness edge is invisible to the analysis entirely.
+
+**Common root cause.** Lexical SSA boundary analysis can only fix an escape set that is **static, intraprocedural, value-oriented, and uniquely bound**. Once the escape's **cardinality**, **identity binding**, or **visibility** depends on runtime data / aliasing / cross-procedure flow, inference cannot bound `k` or cannot pin dynamic producers to fixed PORT slots. Per the §62.4.4 layered policy this then **requires explicit declaration** (`out_ports=k` + `hole.port[i]=`); only when even explicit declaration cannot bound it (typically classes 1 and 6 — truly non-enumerable cardinality or pure side effects) does the region fall back to the §61.7 Option C barrier.
 
 ### 62.5 Lifecycle walkthrough
 
