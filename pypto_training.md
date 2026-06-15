@@ -1986,7 +1986,83 @@ Mapped to the MoE example (§61.4): the **outer `pl.dynamic`** is `top_k_gate` /
 
 ---
 
-## 62. Summary of Part 5 Decisions
+## 62. On-Device Realization: the Dynamic Hole as an AICPU Orchestration Task Injecting into the Live Scheduler
+
+§61.7–§61.9 fixed the *contract* (opaque composite node, thin I/O) and the *placement* (top chooser + static build on host; static execute and the hole on the AICPU). This section specifies the **on-device mechanism**: how an AICPU-resident dynamic hole is launched, builds its own sub-DAG, and is **co-scheduled with the static graph by the single device scheduler** — answering the four concrete questions directly.
+
+### 62.1 The setup
+
+The host CPU builds the **static task graph once** — fan-in / fan-out edges, the tensormap-derived dependencies **resolved into explicit edges**, and the **stack/ring memory plan** (offsets) — and DMAs it to device memory (one-shot copy + one `cache_invalidate_range`, §58). The **AICPU runs the scheduler**: it walks the frozen slot population and dispatches ready tasks to **AIC / AIV** compute workers. The dynamic hole is the open question.
+
+### 62.2 The hole is an AICPU "orchestration task," not a compute task
+
+Introduce a task kind **`ORCH` (builder task)** alongside the compute kinds (AIC / AIV / MIX). In the static graph the hole is a **single `ORCH` slot**:
+
+- **Launch condition = ordinary dependency release.** Its fan-in is the frozen static live-in edges (§61.7). The scheduler releases it exactly like any other node — when `fanin_released == fanin_count`. No special trigger is needed; the hole is just a node whose dependencies clear.
+- **Executed by an AICPU worker, running the orchestration subfunction.** When dispatched, an AICPU worker does **not** launch an AIC/AIV kernel; it **runs the hole's orchestration callable** (the eager builder). This mirrors `simpler`'s SUB worker type (run a callable, not a chip kernel) — except this callable's job is to **submit more tasks**. The AICPU thus plays orchestrator for the duration of the hole, then returns to executing frozen descriptors.
+
+### 62.3 The dynamic sub-DAG is an independent subgraph with a thin boundary — isolate tensormap and ring
+
+**Yes — the dynamic graph should be a completely independent sub-DAG, with its own tensormap and its own stack/ring, separated from the static graph's.** Both isolations are required, for distinct reasons:
+
+- **Private (nested) tensormap.** The static graph carries **explicit, frozen edges** and needs no tensormap at replay (§50). The hole builds its internal dependencies with a **private tensormap** scoped to the hole, torn down at hole completion. Sharing the static tensormap would (a) pollute the frozen plan and (b) give static consumers a **dynamic-cardinality fan-in** (the §61.7 hazard). Only the **boundary** is wired against the outside: live-ins appear as pre-existing producers (or external inputs), live-outs land in the `k` ports.
+- **Private ring / arena.** The static graph's stack-ring **offsets are precomputed** in the host memory plan (§49.3, §60). Allocating the hole's variable-count transients from that arena would break the static offsets and the monotone FIFO reclamation. The hole therefore allocates from a **separate ring layer** — `simpler` already partitions the ring by scope depth (`ring_idx = min(scope_depth, MAX_RING_DEPTH-1)`) with **independent per-ring FIFO reclamation**, so the hole opening a deeper scope automatically gets an isolated ring that **reclaims as a unit** when the hole scope drains, leaving the static arena untouched.
+
+So the subgraph is "independent" in **storage and dependency tracking**, joined to the static graph only by the **thin I/O contract**.
+
+### 62.4 One scheduler, two slot populations — how they are co-scheduled
+
+The decisive property: **the device scheduler is data-agnostic.** It moves slot ids between its wiring / ready / completion queues based only on slot metadata (`fanin_count`, `fanout_consumers`, `state`) — it never inspects whether a slot came from the frozen static graph or was injected at runtime. So both populations live in **one slot pool, one set of queues, one scheduler loop**:
+
+- **Static slots** are loaded **pre-wired**: fan-in counts precomputed, source nodes seeded directly into the ready queue (§50).
+- **Dynamic slots** are created when the `ORCH` task runs: its `submit_*` calls **allocate slots from the hole's ring, derive edges via the private tensormap, and push the new slots onto the *same* scheduler's wiring / ready queues** — byte-for-byte the eager `Orchestrator::submit` flow (`ring.alloc` → tag walk → fan-in → `enqueue_wiring`). The scheduler's Phase-0 wiring, Phase-1 dispatch, and Phase-2 completion then process these slots **interleaved** with static slots, dispatching the hole's internal kernels to AIC/AIV right alongside static kernels.
+
+```text
+                    ONE AICPU SCHEDULER (data-agnostic; keyed on fanin/fanout/state)
+   ┌───────────────────────────────────────────────────────────────────────────┐
+   │  wiring_queue → [Phase0 wire] → ready_queue → [Phase1 dispatch] → AIC/AIV   │
+   │                                            ↑              completion_queue   │
+   └───────────────────────────────────────────┼──────────────[Phase2]──────────┘
+         ▲ pre-wired (counts precomputed)       ▲ submit_* from the running ORCH task
+         │                                      │ (ring.alloc + private tensormap)
+   ┌─────┴───────────────┐              ┌───────┴───────────────────────┐
+   │  STATIC slot pop.    │              │  DYNAMIC slot pop. (the hole)  │
+   │  frozen edges        │              │  private tensormap + ring      │
+   │  static arena        │              │  hole arena (own ring layer)   │
+   └──────────────────────┘              └────────────────────────────────┘
+```
+
+- **Coexistence** = shared queues + shared slot pool + shared loop.
+- **Isolation** = the hole's private tensormap + private ring layer (logical, *not* a second scheduler).
+- **Completion gating (the hole as one producer).** The `ORCH` builder returns after *submitting* the sub-DAG, but the hole's **fan-out to static consumers must not fire until the sub-DAG's live-outs are produced.** Realize this with the **nested-scope drain** `simpler` already has: the builder opens the hole scope, submits into it, and the hole's `k` live-out ports become "ready" only when that scope **drains** (its live-out producer slots reach COMPLETED) — the same composite-completion gating as group tasks (`sub_complete_count == group_size`). Static consumers therefore see the hole as a **single producer that completes once**, preserving their precomputed fan-in (§61.7).
+
+### 62.5 Lifecycle walkthrough
+
+| Step | Where | What happens |
+|------|-------|--------------|
+| 1 | AICPU scheduler | static graph loaded; sources seeded; dispatch proceeds to AIC/AIV |
+| 2 | AICPU scheduler | hole's `ORCH` slot's frozen fan-in clears → released to ready → dispatched to an AICPU worker |
+| 3 | AICPU worker | runs the hole's orchestration callable; **opens the hole scope** (own ring layer + private tensormap) |
+| 4 | AICPU worker | `submit_*` injects the sub-DAG → pushes new slots onto the **live scheduler's** wiring/ready queues; builder returns |
+| 5 | AICPU scheduler | wires + dispatches the injected slots **interleaved** with remaining static slots → AIC/AIV |
+| 6 | AICPU scheduler | sub-DAG live-out producers reach COMPLETED → hole scope **drains** |
+| 7 | AICPU scheduler | hole's `k` live-out ports fire fan-out → release static consumers; **hole ring reclaimed as a unit** |
+| 8 | AICPU scheduler | static execution continues to the region live-out |
+
+### 62.6 One scheduler + injection, *not* a nested scheduler instance
+
+`simpler`'s recursive composition spawns a **full child scheduling engine** for a nested Worker (§ task-flow recursion). On the **scarce AICPU**, spawning a child scheduler **per hole** is too heavy. The recommended design is the opposite: **one device scheduler, dynamic task injection, logical scope isolation.** The independence asked for (separate tensormap + separate ring) is achieved by **scope**, not by a second engine — so a hole costs a scope + a ring layer + a handful of injected slots, not a whole nested runtime.
+
+### 62.7 Budgeting, back-pressure, thread-safety
+
+- **Slot-pool headroom.** The static plan reserves a **dynamic-injection budget** (max sub-DAG size per hole, bucketed like §61.2); the builder back-pressures within that budget, not against the static slots.
+- **Ring sizing.** The hole's ring layer is sized for its peak transient footprint; back-pressure is **per-ring**, so it cannot stall the static rings.
+- **Thread-safety is cheap because it is device-local.** The builder → scheduler hand-off uses the same lock-free wiring/completion queues, all in **coherent device GM** within the AICPU↔AICore snoop domain — ordinary on-device atomics, **never** cross-bus (contrast §57). This is exactly why the hole *must* stay on the main `aicpu_scheduler` cluster in **one unified runtime `.so`** (replay + submit), not the cust subprocess (#822, §61.9).
+- **Nested holes** simply open deeper scopes (deeper ring layers, clamped at `MAX_RING_DEPTH`); multiple concurrent holes are independent slot sub-populations the one scheduler already interleaves.
+
+---
+
+## 63. Summary of Part 5 Decisions
 
 1. **Removing Python ≠ removing dynamic construction.** The codegen'd C++/AICPU orchestrator is still a define-by-run interpreter that re-derives the same DAG every step (TensorMap hashing, ring alloc, scheduler wiring, cross-thread hand-off). For inference decode this is pure redundancy.
 2. **Don't fully AOT-compile free control flow** (undecidable / requires tracing all branches). Instead **capture the realized DAG once and replay it** — the orchestration-layer CUDA-Graph, and the natural extension of the §8.1 *job A (build) vs job B (execute)* split: replay kills job A's per-step cost, job B is reused verbatim.
@@ -2001,3 +2077,4 @@ Mapped to the MoE example (§61.4): the **outer `pl.dynamic`** is `top_k_gate` /
 11. **The eager/AOT boundary is programmer-scoped in the DSL** via `with pl.static()` (capturable/replayed) vs `with pl.dynamic()` (eager), plus `pl.symint(..., buckets=...)` to capture shape-dynamic regions **parametrically** (e.g. MoE `m_e`). Static bodies must be topology-pure; data-dependent control flow lives in `pl.dynamic` (the chooser) or a nested dynamic hole. `pl.auto` / `pl.set_capture_mode` allow a global default and a path to compiler-inferred regions (§56 P5) — the marked scopes are both today's front end and tomorrow's optimization target.
 12. **A dynamic hole inside a static region is an opaque composite node, not a barrier** (§61.7): fixed live-in set + `k` live-out ports are frozen into the static artifact; the hole's internal sub-DAG is built eagerly each replay with a **private local tensormap** (never captured) and signals completion once (group-task gating), so only its real consumers wait while independent static work overlaps. Neither tensormap-in-capture nor a global barrier is needed.
 13. **Recommended placement maps the nesting onto the hardware** (§61.9): the **top dynamic chooser + the static build run on the host CPU** (one one-shot copy per region launch), the **static region executes on AICPU+AICore**, and the **dynamic hole runs on the AICPU** (device-local eager build via the PTO2 tensormap, no mid-region host round-trip). Unify replay + eager-build in **one runtime `.so` on the main `aicpu_scheduler` cluster** (Path A), never the cust subprocess (Path B / #822 coherency trap).
+14. **On device, the hole is an `ORCH` (builder) task co-scheduled by the one data-agnostic scheduler** (§62): it is released by the normal fan-in mechanism, run by an AICPU worker that `submit_*`-injects an **independent sub-DAG** (private tensormap + private ring layer) onto the **same** wiring/ready/completion queues as the static slots. Static and dynamic slots **coexist in one slot pool / one loop**; **isolation is by scope, not a second scheduler**; the hole fires its `k` live-out ports to static consumers only when its **nested scope drains** (composite completion gating); all hand-offs are **device-local coherent atomics**.
