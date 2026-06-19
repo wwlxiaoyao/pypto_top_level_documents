@@ -2271,3 +2271,430 @@ The live-out *set* varies with the path; it is not a single static set, so infer
 12. **A dynamic hole inside a static region is an opaque composite node, not a barrier** (§61.7): fixed live-in set + `k` live-out ports are frozen into the static artifact; the hole's internal sub-DAG is built eagerly each replay with a **private local tensormap** (never captured) and signals completion once (group-task gating), so only its real consumers wait while independent static work overlaps. Neither tensormap-in-capture nor a global barrier is needed.
 13. **Recommended placement maps the nesting onto the hardware** (§61.9): the **top dynamic chooser + the static build run on the host CPU** (one one-shot copy per region launch), the **static region executes on AICPU+AICore**, and the **dynamic hole runs on the AICPU** (device-local eager build via the PTO2 tensormap, no mid-region host round-trip). Unify replay + eager-build in **one runtime `.so` on the main `aicpu_scheduler` cluster** (Path A), never the cust subprocess (Path B / #822 coherency trap).
 14. **On device, the hole is an `ORCH` (builder) task co-scheduled by the one data-agnostic scheduler** (§62): it is released by the normal fan-in mechanism, run by an AICPU worker that `submit_*`-injects an **independent sub-DAG** (private tensormap + private ring layer) onto the **same** wiring/ready/completion queues as the static slots. Static and dynamic slots **coexist in one slot pool / one loop**; **isolation is by scope, not a second scheduler**; the hole fires its `k` live-out ports to static consumers only when its **nested scope drains** (composite completion gating); all hand-offs are **device-local coherent atomics**.
+
+---
+
+# Part 6 — Decentralizing Orchestration: SPMD "Every Core Runs the Whole Program"
+
+> **Scope note.** Parts 1–4 added training on top of the *centralized* `simpler` model (one orchestrator submits, one scheduler dispatches to AIC/AIV workers). Part 5 (§46–§63) kept that exact hot path but removed the *per-step rebuild* cost (capture/replay) and moved the *builder* to the host (build-once / execute-autonomously), leaving **one device scheduler** that walks a frozen slot population and dispatches. Part 6 confronts a deeper question raised against *both*: even a frozen, host-built graph is **dispatched by a single, somewhat centralized agent** — the orchestrator that produces the submit stream and the scheduler that moves slots through `wiring → ready → completion`. As core count grows and InCore tiles shrink, that single agent is an **Amdahl serial section** and a **throughput ceiling**. This Part analyzes the opposite architecture: **compile the whole program — orchestrator control flow *and* InCore bodies — into one image, run it on *every* core, and let a *worker identity* select each core's slice of the work**, replacing the central scheduler/tensormap with **distributed synchronization**. This is the SPMD / persistent-"megakernel" model. We give the synchronization scheme, the supporting data structures, the hardware mechanisms it needs, and a head-to-head comparison with the simpler runtime and the Part 5 enhancement.
+
+## 64. The Bottleneck This Part Attacks: a Centralized Orchestrator + Scheduler
+
+Both shipped/proposed designs route **all** work through a single coordinating agent:
+
+- **`simpler` (today).** One **orchestrator** thread executes the program and `submit()`s InCore tasks; one **scheduler** (the AICPU `tensormap_and_ringbuffer` loop, or its host analog) does the tag-walk, fan-in counting, ring allocation, wiring hand-off, dispatch, and completion/fan-out release — **per task**. Workers (AIC/AIV) only compute.
+- **Part 5 (§57–§63).** The *builder* (job A) is amortized (capture/replay) and/or moved to the host, but **job B is still one scheduler loop** on the scarce AICPU: it pops `ready_queue`, dispatches to AIC/AIV, and on completion releases fan-out — `O(#tasks)` sequential work funneled through **one** agent (§62.6 even argues *against* a second scheduler instance for holes, precisely because the AICPU is scarce).
+
+The serial-section problem is quantitative. Let each InCore tile take compute time `t` on a worker, and let the scheduler's amortized per-task overhead (pop + dispatch + completion + fan-out release) be `d`. One scheduler sustains at most `1/d` dispatches/sec. `N` workers draining tiles demand `N/t` dispatches/sec. The workers **starve** whenever
+
+```text
+   N / t  >  1 / d        ⇔        N  >  t / d
+```
+
+i.e. once the core count exceeds the tile's compute-to-dispatch ratio. PyPTO's pressure is **exactly in the bad direction**: InCore tiles are deliberately small (SRAM-sized, so `t` is small), the unrolled graph is huge (`#tasks` in the millions, §59), and accelerator core counts keep rising (large `N`). The faster the silicon and the finer the tiling, the more a single dispatcher becomes the wall — and it is on the **scarcest** resource (AICPU). Capture/replay removes the *builder* cost but not this *dispatcher* cost; the dispatcher is **intrinsically centralized** in every Part 1–5 design.
+
+The structural fix is to **remove the central agent entirely**: if every core can compute *which* work is its own and *when* its inputs are ready, no dispatcher is needed. That is Part 6.
+
+## 65. The Proposed Scheme: SPMD Persistent Workers Selected by a Worker Identity
+
+**The idea in one sentence.** Compile the entire PyPTO program — the orchestrator's control flow *and* the InCore bodies — into a **single persistent image**, launch **one copy on every participating core**, and let the cores **compete to pull ready work** (their **worker identity** `rank` serving as a locality hint and a role selector, not a fixed assignment); cross-core producer→consumer edges that the central tensormap used to resolve are instead resolved by **distributed synchronization** the cores perform among themselves.
+
+This borrows the **SPMD** *launch* model (Single Program, Multiple Data — one image on every core, selected by `rank`) and the **persistent "megakernel"** *residency* model (cores launched once, looping over the schedule, never relaunched per task by a dispatcher). But — and this is the point §65.2 makes carefully — it is **not** the classic **homogeneous BSP** model where every worker runs the *same* operation in lock-step super-steps. Here every core holds the *whole* program, so the **runtime behavior is heterogeneous**: identity + the state of shared queues/buffers/sync flags steer different cores down different control-flow paths and roles. The crucial inversion versus Parts 1–5:
+
+| | Parts 1–5 (centralized) | Part 6 (SPMD) |
+|---|---|---|
+| The **schedule** is… | **data** — a tensormap + a slot pool + a `Task[]` that one agent walks | **a function** — `owner(work)` and `deps(work)`, **evaluated redundantly and identically on every core** |
+| Work **assignment** | dynamic: scheduler pops `ready_queue`, hands the next ready task to the next free worker | dynamic **competition**: cores pull ready work from shared per-core deques and **steal** to balance; `owner()` is only a locality hint (§67.1) |
+| **Dependencies** | resolved centrally (tensormap fan-in; one scheduler releases fan-out) | resolved locally: a completing core decrements its consumers' fan-in / posts its flag; readiness propagates with **no central agent** |
+| **Coordination cost** | `O(#tasks)` dispatch on **one** agent (the §64 ceiling) | scheduling work **distributed** across all cores — `O(#tasks×#edges / N)` each, fully parallel; only contention is the rare steal |
+
+### 65.1 What "worker identity" is and does
+
+`rank` is a small immutable per-core value, e.g. `rank = (cluster_id, core_id)` plus a logical role tag, with `N = total participating cores`. The program is **written once** and **branches on `rank`** in three ways:
+
+1. **Work selection (dynamic competition, *not* a static partition).** Cores do **not** each run a fixed `owner(l,t)==rank` slice; they **compete to pull ready work** from shared per-core deques and **steal** to balance (the distributed work-stealing scheduler, §67.1). The affine `owner(l, t, …) → rank` over the §60 iteration space survives only as a **locality hint** (seed/steal bias), not as a binding assignment — so regular work gets locality and irregular work still balances. This is the §60 template **executed cooperatively and competitively by all cores**, not expanded by one scheduler.
+2. **Data ownership / placement.** A tensor tile is **stored at a fixed affine address** known to every core via the §60 memory plan (`base + l·layer_stride + t·tile_stride`), so whichever core computes a tile writes it where all consumers expect it — no central allocator, and the producer's identity need not be known in advance (only its completion, via the flag/fan-in, §67).
+3. **Role selection** (when needed). A `rank` may take an orchestration-only role for an irregular sub-region (a "leader," §67.5), or map onto the Linqu hierarchy (which cores form a core-group, which form a chip).
+
+Because the control flow is **topology-pure** (the §61.3 requirement, now applied to the whole captured region, not just a static block), every core agrees on the *same* `deps()`/`addr()` **dependency structure** with **no negotiation** — and *that* shared, consistent topology (not a fixed work partition) is what lets the cores schedule themselves cooperatively (§67.1) and makes a central dispatcher removable. Who runs which task is decided dynamically by competition; what depends on what is agreed for free.
+
+### 65.2 This is *not* homogeneous BSP — it is one program image with heterogeneous, queue-mediated behavior
+
+A caution that reshapes the whole analysis: the textbook **SPMD/BSP** picture is **homogeneous** — every worker runs the *identical* operation on a different data shard, advancing in **lock-step super-steps** separated by **global barriers**. That model has well-known limits: it expresses only **data parallelism**, it **idles every worker on the slowest** at each barrier, and it has **no natural way to specialize** (no pipelines, no producer/consumer division of labor, no on-the-fly role changes). If Part 6 were only that, the §71 "static partition ⇒ load imbalance / weak on dynamic control flow" cons would be fatal.
+
+But this scheme is **richer than homogeneous BSP**, precisely because **the entire program is resident on every core**. That single fact means any core *can* execute any part of the program, so the choice of *what a given core actually does* becomes a **runtime, state-driven** decision rather than a fixed homogeneous role. Introducing **queues, buffers, and fine-grained sync points** turns the `N` identical images into a set of cores whose **behavior is heterogeneous and asynchronous**:
+
+- **Independent program counters — true MIMD, *not* SIMT (no divergence penalty).** This is the deepest difference, and it must not be confused with the GPU's SPMD-via-SIMT model. In SIMT, the threads of a **warp share one program counter** and advance **cycle-by-cycle in lock-step**; a data-dependent branch that sends threads different ways is executed by **masking** — the warp walks *both* sides serially and disables the inactive lanes, so **divergence is a direct performance penalty** (and shared-PC reconvergence, not real independence). The present proposal is the opposite: **each AI core runs its own private program counter and its own control flow**, so two cores taking different branches cost **nothing** relative to taking the same branch — there is **no warp, no lane masking, no reconvergence, no divergence penalty whatsoever**. Control-flow divergence *between* cores is **first-class and free**, which is exactly what makes heterogeneous per-core roles (below) cheap. The only place a data-dependent decision still costs anything is when cores must **agree on a shared partition** of newly-revealed work (§67.5) — that is a *coordination* cost (one barrier + a broadcast), categorically different from SIMT's *per-branch execution* cost. (So the §71 "dynamic control flow is hard" con is about **cross-core work-partition agreement and load balance**, never about branch divergence itself, which is penalty-free here.)
+- **Functional / role specialization (MPMD behavior from an SPMD image).** Identity (and the runtime state of queues) lets `rank`s diverge into distinct roles — producer cores, consumer cores, reduction/all-reduce cores, a **leader** that orchestrates an irregular sub-region (§67.5), router cores in MoE — i.e. **task and pipeline parallelism**, not just data parallelism. This is "single program, *divergent* behavior," closer to a **distributed dataflow / CSP / actor** network than to BSP.
+- **Asynchrony instead of lock-step.** With per-core **work/data queues** and **point-to-point sync**, cores need not be at the same program point. A core posts results into a queue and moves on; a downstream core consumes when its inputs arrive. Cores **pipeline** through the program at their own pace, so a fast core is not pinned to the slowest by a global barrier — directly defeating BSP's central weakness.
+- **Dynamic role assumption without reload.** Because the whole program is co-resident, a core can *become* the orchestrator for a dynamic hole, switch pipeline stages, or pick up rebalanced work **without any code reload or central re-dispatch** — it just follows the branch its identity + the queue state selects. This is what makes the §67.5 "leader" cheap: the leader is not special hardware or a separate binary, just whichever `rank` the program routes into that role at that moment.
+- **Heterogeneous work is first-class.** Irregular/ragged workloads (MoE experts of unequal load, variable sequence lengths) are handled by **queue-mediated decoupling** — cores drain a shared work/data queue (or their owned slice plus a steal queue) rather than all executing an identical shard — so imbalance is absorbed by **asynchronous consumption**, not paid as barrier idle.
+
+So the accurate mental model is: **a single resident program + worker identity + queues/buffers/sync = a self-organizing distributed dataflow machine**, where homogeneous lock-step BSP (§67.2) is merely the **degenerate, coarsest** synchronization regime — useful when it happens to fit, but not the ceiling of the model. The queue/buffer/async-sync machinery (§67.3, and the role/queue specialization above) is what lifts this scheme past the classic BSP limitations; the cost it adds is that **per-core behavior, and therefore correctness and debugging, is genuinely heterogeneous and asynchronous** (§71).
+
+## 66. The Enabler: Replacing the Central Tensormap with a Redundantly-Evaluated Dependency Function
+
+The single most important observation is that **PyPTO's tensormap is recomputable**. The tensormap is a runtime data structure that answers one query — *"given a consumer tile, which tiles produced its inputs?"* — by tag-matching as tasks are submitted. But for a **topology-pure** region, the answer is a **pure function of the indices**:
+
+```text
+   deps(l, t)  →  { (l', t', epoch') , ... }      // the producer tiles of consumer (l,t)
+   owner(l, t) →  rank                            // who computes / stores (l,t)
+   addr(l, t)  →  GM offset                       // where (l,t) lives (the §60 affine plan)
+```
+
+These three functions are *exactly the information the centralized scheduler distilled into the tensormap + slot fan-in counts + ring offsets* — but expressed as **code the compiler already has** (it derived the tensormap-producing tile algebra in the first place). The shift is:
+
+- **Central tensormap (data, shared, one writer)** → **dependency function (code, replicated, evaluated per core).**
+
+Each core, to run a consumer `(l,t)` it has pulled from its deque (§67.1), calls `deps(l,t)`, finds each producer's `addr`, **confirms the producer is done** (its flag is posted / its fan-in already cleared), then reads from `addr` and computes; on finishing, it uses `deps`/fanout to release *its* consumers. No core asks a central structure "is X ready?"; readiness is computed from the function and the distributed counters/flags. **Redundant evaluation of `deps()`/`addr()` on every core is the price; eliminating the central bottleneck is the payoff** — and the redundant part is cheap branch-free index arithmetic (§60), not the expensive tag-walk/hashing the central scheduler paid (§46).
+
+This is also why Part 6 is the **natural endpoint of Part 5, not a competitor**: §60 already made the schedule a **parametric template + iteration space + affine binding**; Part 5 hands that template to *one* device scheduler to expand and dispatch; Part 6 hands the *same* template to *all* cores to expand and execute cooperatively. Same artifact, decentralized consumer.
+
+> **What must be consistent is the *dependency structure*, not *who runs what*.** Work assignment is dynamic (cores compete and steal, §67.1), so cores need **not** agree on a partition. They **must**, however, agree on the *topology* — `deps()`/`addr()` — because every completing core decrements its consumers' fan-in via `deps()`, and that bookkeeping must be globally consistent. For a **topology-pure** region this is automatic (the same `deps()` everywhere). A **data-dependent** region is therefore the hard case (§67.5): the cores must first **agree on the realized topology** (one barrier + broadcast of the decision/symint) before competition can safely resume. So SPMD demands either topology-purity or an explicit one-shot re-synchronization of each data-dependent decision — but it does **not** demand a static work partition.
+
+## 67. The Synchronization Scheme
+
+With no central scheduler to enforce ordering, correctness rests entirely on the cores coordinating among themselves. **Two orthogonal questions** must be answered, and they should not be conflated:
+
+- **Assignment — *which core runs a given task*?** The answer (§67.1) is **dynamic competition**, not a fixed rank-based partition: cores pull ready work from shared queues and steal to balance. The affine `owner()` is kept only as a **locality hint**.
+- **Ordering — *when may a task run / its output be read*?** Three regimes, coarsest to most general — global barriers (A, §67.2), point-to-point flags (B, §67.3), and asynchronous queue-mediated heterogeneous roles (C, woven through §67.1 + §65.2). Only A is the homogeneous lock-step BSP picture; **B and C are what give this scheme its heterogeneous, asynchronous character (§65.2)**.
+
+The recommended design is a **hybrid**: dynamic-competition assignment, with each ordering regime used where it fits.
+
+### 67.1 Work assignment: cores *compete* for ready work (distributed work-stealing) — affinity is only a hint
+
+**The default is *not* a fixed `owner(l,t) == rank` partition.** Instead **all cores compete to pull ready work from shared queues** — a faster or luckier core simply does more — which recovers the *dynamic load balancing* of the central scheduler **without** a central dispatcher. The reframing that makes this work:
+
+> **The centralized scheduler is *distributed*, not deleted.** Every worker core is *also* a scheduler for the tasks it completes. The scheduler's per-task bookkeeping (decrement each consumer's fan-in, push the now-ready ones) is performed by whichever core finishes the producer — so the `O(#tasks × #edges)` scheduling work is spread across all `N` cores (`O(#tasks × #edges / N)` each), fully parallel, with **no single agent and no §64 dispatch ceiling**.
+
+**Mechanism — a distributed ready-queue / work-stealing scheduler:**
+
+- **Fan-in counters in GM.** Each task slot carries an atomic `fanin_remaining` (initialized from `deps()`, §66) — the *same* count the central scheduler kept, but now a **shared atomic any core may decrement**.
+- **Per-core deques + steal (Chase–Lev).** Each core owns a local LIFO ready-deque it `push`/`pop`s lock-free at its own end; when empty, it **steals** from the tail of another core's deque (or a shared overflow queue). Most operations are local and contention-free; **stealing is the only cross-core traffic and happens only under imbalance**.
+- **Completion drives readiness.** When a core finishes task `p`, it walks `p`'s consumers (via `deps`/fanout, §66), `atomic_dec`s each consumer's `fanin_remaining`, and any that hit 0 are **ready** — the completing core `push`es them onto **its own** deque (locality: a consumer usually reuses `p`'s just-produced data). Steals then rebalance globally.
+- **Seed.** Source tasks (`fanin == 0`) are scattered round-robin onto cores' deques at launch; execution self-propagates from there.
+
+**Affinity as a hint, never a law.** The affine `owner(l,t)` of a pure-static partition is **not discarded — it is demoted to a scheduling *hint***: (a) seed/`push` a task preferentially onto the deque of the core holding the bulk of its inputs (locality → less cross-core sync), and (b) bias steals toward **hierarchy-near victims** (steal within a core-group before reaching across chips, §69). So locality is exploited **when free**, but **never enforced at the cost of leaving a core idle** — competition always overrides affinity. This is strictly more flexible than static owner-computes: regular workloads still get locality; irregular ones still get balance.
+
+**Why this beats both extremes.** Versus the **central scheduler** (§64): dispatch + fan-out work is parallelized across all workers, so the single-agent throughput ceiling disappears. Versus a **pure-static rank partition**: load balances dynamically and **data-dependent / ragged work is handled natively** — a dynamically-generated task is simply `push`ed onto a deque and the next free core grabs it (§67.5), with **no leader needed for balancing**. The costs are (i) **contention on the shared atomics/deques**, kept low by the local-first / steal-on-empty design, and (ii) **nondeterministic execution order** — note the *results* stay deterministic (all `deps` are respected), only the core→task mapping varies.
+
+### 67.1.1 Who creates the task slot? — there is no per-task allocator
+
+In the centralized model a **slot** is a heap object the orchestrator's `submit_*` *allocates* from the slot pool at runtime, carrying `fanin_count`, a `fanout_consumers` list, and `state`; the wiring phase (§62.4.1) then installs its reverse edges. SPMD **dissolves that object** — there is no allocation step and no creator on the steady-state path. A slot's three former responsibilities are split into pieces that are either *implied by an index* or *reserved once*:
+
+| Former slot field | SPMD replacement | Who "creates" it |
+|---|---|---|
+| **identity** (a pointer/handle) | the **index `(l,t)`** itself | nobody — it is an element of the §60 iteration space, known at compile time (parametric over symints) |
+| **`fanin_count`** | `fanin_remaining[idx(l,t)]`, a slot in a **GM array sized to the iteration-space cardinality** | the **host/loader reserves the array once** at region launch; its initial value `|deps(l,t)|` is a pure function, so **each core fills the strided slice it touches** (parallel init, no central writer) |
+| **`fanout_consumers` list + state** | computed on the fly via `fanout()` (§67.1.2); "ready" = present in some core's deque | created by **whichever core makes the task ready** (see below) |
+
+So the answer differs by region kind:
+
+1. **Topology-pure (static) region — nobody creates slots.** The task set is exactly the iteration space; "a slot" is just a reserved index. The `fanin_remaining`/`flags`/`addr` arrays are laid out **once** at region setup (sized to the template, bucketed for symints, §61.2). No `submit`, no pool, no allocation — this absence is precisely what removes the §64 serial section.
+2. **Readiness (queue membership) is created by the producer that finishes last.** A task's *existence* is static, but its entry **into a ready deque** is produced at runtime by the core that clears its final fan-in: on completing `p`, that core walks `fanout(p)`, `atomic_dec`s each consumer's `fanin_remaining`, and `push`es the now-zero ones onto its own deque. **Source tasks** (`fanin==0`) are seeded round-robin at launch. So "who enqueues you" = "whoever made you ready" — the literal meaning of *every worker is also a scheduler* (§67.1).
+3. **Data-dependent region (the §67.5 hole) — the builder core creates the dynamic slots, once, after agreement.** Only when the *number* of tasks is a runtime value is there a genuine creation step: after the barrier+broadcast fixes the symint, the core(s) running the builder initialize the new tasks' `fanin_remaining` (from `deps()` over the realized bounds) and `push` the source ones onto the **shared work-stealing queues**. This is the §62 `ORCH` builder — but its output flows into the distributed deques, so creation is centralized only for that instant, never for execution.
+
+In one line: **identity is compile-time (an index), the counter array is reserved once, and "readiness" is created in flight by the completing producer — there is no runtime per-task slot allocator at all** (except the one-shot builder inside a data-dependent hole).
+
+### 67.1.2 We used fan-in — do we still need fan-out? — Yes, but as a *function*, not stored lists
+
+Short answer: **fan-out is still needed, but in SPMD it is a *pure function* `fanout(l,t)`, evaluated on the fly — not the stored `fanout_consumers` lists + wiring phase the centralized scheduler maintained.** Fan-in and fan-out are the **same dependency relation read in two directions**, and the work-stealing scheduler uses *both*:
+
+- **`deps(l,t)` (fan-in / forward edge)** is used to (a) **initialize** `fanin_remaining[idx] = |deps(idx)|` (§67.1.1), and (b) let a consumer find **where to read** its inputs (`addr` of each producer) and, in the flag regime, **which flags to wait on** (§67.3).
+- **`fanout(l,t)` (fan-out / reverse edge)** is used by a **completing producer** to know **whom to release**: which consumers' `fanin_remaining` to decrement and possibly `push`. Without it, a finished producer would not know which counters to drop, and ready tasks would never enter a deque.
+
+The real difference from the central scheduler is **not** "fan-out vs no fan-out" — it is **stored vs computed**:
+
+| | Centralized (`simpler`/Part 5) | SPMD (Part 6) |
+|---|---|---|
+| fan-in | `fanin_count` per slot, set by the wiring phase | `fanin_remaining[idx]` array, initialized by `|deps(idx)|` |
+| fan-out | **stored `fanout_consumers` list** per producer, **installed by Phase-0 wiring** (§62.4.1) because `submit` only saw forward edges and couldn't invert them cheaply | **`fanout(l,t)` pure function**, evaluated by the completing core — **no stored list, no wiring phase** |
+
+Why the centralized design had to *store* the reverse edges: `submit` discovered the forward relation incrementally (consumer→producers, by tensormap lookup) and could not cheaply invert it, so the scheduler materialized `fanout_consumers` under `fanout_mu` in a separate wiring step (§62.4.1). SPMD has the whole topology as **code** (§66), so it just **calls `fanout()`** in the direction it needs — the compiler emits `deps` and `fanout` as two views of the one relation (each derivable from the other). This is the same "data → function" move that replaced the tensormap, applied to the reverse edges too.
+
+**When can fan-out be dropped entirely?** Only by changing the *readiness representation*:
+
+- **Pure barrier (Regime A, §67.2):** no fan-out *and* no fan-in counters — readiness is "the previous super-step's barrier has fired," so a completing producer notifies nobody. Coarse, but the cheapest. This is why BSP needs neither edge direction.
+- **Pure consumer-pull on flags (Regime B without push):** a consumer waits on its producers' flags via `deps()` only, so the *producer* needs no fan-out (it just `store_release`s its own flag). But then **the consumer task must already be in a core's hands to do the waiting** — which means *enumeration/owner-computes assignment*, not a ready-deque populated on demand. The moment you want a **work-stealing ready queue** (a task enters a deque *only when ready*, so no core ever picks a blocked task), you need the producer to *push* readiness — i.e. you need `fanout()`.
+
+So the design choice is: **work-stealing (the §67.1 default) ⇒ fan-out is required, as the function `fanout()`**; **pure barriers ⇒ neither direction is needed**; **pure flag-pull ⇒ fan-in (`deps`) only, but you give up the on-demand ready queue**. The recommended hybrid uses fan-in counters + the `fanout()` function for the fine-grained competitive path, and falls back to barriers (no edges) at coarse phase boundaries.
+
+### 67.1.3 How `fanout()` is computed
+
+`fanout(l,t)` returns the **consumer tile indices** of producer `(l,t)` — the reverse of `deps`. It is produced **at compile time** and evaluated as cheap index arithmetic at runtime; no core ever inverts anything live. Three layers, from the common case down:
+
+**1. The compiler already holds the relation — it just emits both directions.** PyPTO derives tile dependencies from the orchestrator-level tile algebra (the same analysis that produces the tensormap tags). For the §60 template this dependency graph is **one subgraph per task type** with a fixed set of edges, parametric over the iteration indices `(l,t,…)` and symints. Lowering emits **two traversals of that one edge set**: `deps` (walk edges backward → producers) and `fanout` (walk forward → consumers). So `fanout` is simply the **forward adjacency of the template DAG, expressed as a closed-form function of the indices** — materialized once by the compiler, not discovered at runtime.
+
+**2. For affine dependence patterns, `fanout` is the *inverse affine relation*.** Almost all PyPTO edges are (quasi-)affine: a consumer's inputs are `p = M·c + b` for a small set of offset vectors `b` (elementwise, GEMM tiling, stencils, reductions, transposes). The reverse is obtained by **affine/Presburger relation inversion** — solving `M·c + b = p` for `c` — which yields another closed-form (quasi-)affine set (possibly with `floor`/`mod`). Worked cases:
+
+```text
+  elementwise   deps(c) = {c}                      ⇒  fanout(p) = {p}                        (identity)
+  reduction     deps(l+1, t) = {(l, 2t),(l,2t+1)}  ⇒  fanout(l, t) = {(l+1, t/2)}             (halving)
+  GEMM A-tile   C[i,j] reads A[i,k] (all j)         ⇒  fanout(A[i,k]) = {(i,j,k) : j∈[0,Nj)}    (affine range)
+  GEMM B-tile   C[i,j] reads B[k,j] (all i)         ⇒  fanout(B[k,j]) = {(i,j,k) : i∈[0,Ni)}
+  stencil       deps(c) = {c+δ : δ∈S}               ⇒  fanout(p) = {p−δ : δ∈S}                 (mirrored nbhd)
+```
+
+The compiler performs this inversion once during lowering; the emitted `fanout` is a handful of affine expressions or a bounded loop nest over an affine range (parametric over symints, §61.2). Cost at runtime is **O(fan-out degree) branch-free arithmetic with no memory lookups** — versus the central scheduler's locked walk of a stored `fanout_consumers` list.
+
+**3. `fanout` returns indices, never core ids — so it is decoupled from assignment.** Crucially, the completing producer uses `fanout(l,t)` only to index the **shared** `fanin_remaining[idx(consumer)]` array (GM, addressed by tile index) and decrement it; it does **not** need to know *which core* will run the consumer. Readiness is published to a global index-addressed counter; whichever core ends up owning the ready task (its own deque after `push`, or a thief) is decided later by competition (§67.1). This is why `fanout` stays a pure index function even though assignment is dynamic.
+
+**Irregular / non-invertible edges.** When the forward relation is not cleanly invertible at compile time — data-dependent indexing, gather/scatter, a runtime permutation (MoE dispatch) — `fanout` cannot be a static closed form. Two fallbacks, matching §67.5: (a) after the agreement step fixes the permutation/symint, the realized relation **is** affine again and `fanout` is emitted over the realized bounds; or (b) the producer **materializes its consumer set explicitly** by writing a small per-producer fanout list into GM during the build (the only case that resembles the centralized stored list — used only inside the data-dependent hole, never in the topology-pure bulk).
+
+**Self-check.** Because `deps` and `fanout` are two views of one relation, the compiler validates them as mutual inverses (every edge appears in exactly one `deps` set and one `fanout` set; `Σ|deps(c)| == Σ|fanout(p)|`) — the static analog of `dep_gen`'s dual-pass capture check (§48, §53).
+
+### 67.1.4 "But we deleted the tensormap and the global DAG — where does `fanout` come from?"
+
+This is the natural objection. In `simpler` the orchestrator **builds the dependency graph at runtime**: each `submit_*` does a **tensormap** tag-lookup to *discover* a consumer's producers (fan-in), and the wiring phase (§62.4.1) then *installs* the reverse edge as a stored **`fanout_consumers` linked list** on each producer slot. Part 6 deletes the tensormap and that runtime-built DAG — so how can a completing core know its consumers?
+
+**The resolution: we delete the *runtime data structure*, not the *dependency relation*.** What is removed is the per-step tensormap and the materialized fanin/fanout **linked lists**; what is kept — relocated from runtime to compile time — is the **relation itself**, now expressed as the functions `deps`/`fanout` (§67.1.3).
+
+| | `simpler` (define-by-run) | Part 6 (topology-pure SPMD) |
+|---|---|---|
+| **When** the relation is obtained | **every step**, at runtime | **once**, at compile time (or first-run capture) |
+| **Where** it comes from | the orchestrator re-discovers it via tensormap tag-matching | the compiler **already knows it** from tiling/outlining |
+| **How** it is stored | dynamically-built fanin/fanout **linked lists** in a slot pool | **closed-form functions** `deps`/`fanout`, replicated read-only |
+| **Who** uses it | one central scheduler walks the lists | every core evaluates the function for the tasks it touches |
+
+**Why `simpler` had to build it at runtime — and why we no longer must.** `simpler` is define-by-run and makes **no topology-purity assumption**, so in general it *cannot* know the graph until it executes, and must rediscover it each step. But for a **topology-pure** region (the §61.3 / §60 precondition that Part 6 requires), the producer→consumer structure is **fixed and already computed by the compiler** — indeed it is the *very information the compiler encodes into the tensormap tags in the first place*: when `auto_chunk` / `OutlineIncoreScopes` tile a loop and outline InCore functions, they know exactly which tile writes which buffer and which tiles read it. So `simpler`'s runtime tensormap is, for a pure region, **re-deriving at runtime what the compiler knew at compile time** — exactly the redundancy §46 identified. Part 6 simply **harvests that compile-time knowledge directly** and emits it as `deps`/`fanout`, skipping the runtime rediscovery.
+
+**This is the same "build once" as Part 5, taken one step further.** Part 5 already showed the graph need not be rebuilt per step: **capture it once** and freeze it into explicit edges (`host_build_graph`). Part 6 takes the *same* once-derived relation but stores it as a **parametric function** instead of a frozen edge list — so instead of one scheduler walking frozen `fanout_consumers` arrays, every core *computes* `fanout(l,t)` on demand. The dependency information has the **same origin** (a one-time derivation); only its *representation* (function vs. list) and its *consumer* (all cores vs. one scheduler) change.
+
+**The honest boundary — the data-dependent hole.** When topology is genuinely data-dependent (MoE dispatch, runtime gather/scatter, a count that is not a symint), the compiler **cannot** emit a static `fanout`, and there is no escaping a runtime-built structure. This is precisely §67.5 fallback (b): inside the hole, the builder **materializes an explicit per-producer fanout list in GM** as it submits — i.e. it *does* rebuild the linked list `simpler`-style, but **confined to the small dynamic sub-DAG**, never for the topology-pure bulk. So Part 6 does not claim to abolish runtime graph-building everywhere; it claims to **eliminate it for the regular 95%** (where the relation is a compile-time function) and **retain it only for the irregular tail** (where it is unavoidable).
+
+### 67.2 Regime A — Bulk-Synchronous super-steps (barriers) — the *degenerate, homogeneous* regime
+
+This is the **classic homogeneous BSP** regime, and the **coarsest/weakest** of the three: use it only when a layer/stage boundary is a natural fence. It governs **ordering**, not assignment — within a super-step the cores still pull tiles by competition (§67.1); the barrier only guarantees that all of step `k`'s writes are visible before step `k+1`'s reads. So within a super-step a core computes the tiles it pulls, reading *only* data produced in **earlier** super-steps; it writes its outputs; all cores **arrive at the barrier**; after the barrier the next super-step's cross-core reads are safe.
+
+```text
+  super-step k     ┌── core0: tiles it pulls ──┐
+                   ├── core1: tiles it pulls ──┤   (no cross-core reads of this step's writes)
+                   ├── ...                     ┤   (assignment by competition/steal, §67.1)
+                   └── coreN: tiles it pulls ──┘
+                        ▼ ▼ ▼  GLOBAL BARRIER (all arrive; all writes now visible)
+  super-step k+1   ┌── core0: more tiles (may read step-k outputs of ANY core) ──┐ ...
+```
+
+- **Pros:** dead simple, no per-edge bookkeeping, trivially correct, maps to one hardware primitive. It is the natural granularity for a transformer **layer** or a GEMM **K-loop stage**.
+- **Cons:** **over-synchronization** — the barrier stalls a core that finished early even if its next-step work depends on nothing slow. This is exactly the §61.7 **Option C global barrier** that Parts 1–5 *rejected for holes* — but here, distributed across hardware rather than realized as a scheduler drain, and used as a **first-class structuring tool** rather than a last resort. Cost ≈ idle waiting on the **slowest** core per step (load-imbalance sensitive).
+
+### 67.3 Regime B — Point-to-point producer→consumer flags (fine-grained)
+
+Drop the global barrier; instead, each consumer waits on **only its specific producers**. Maintain a **completion-flag array** in GM, one slot per producible tile (indexed by `(l, t)` or a hash), carrying an **epoch/version counter** (§67.4):
+
+```text
+   producer core, after computing & storing (l,t):
+       store_release  flag[idx(l,t)] = epoch          // publish: my output is ready
+
+   consumer core, before reading producer (l',t'):
+       for p in deps(l,t):
+           wait_until  flag[idx(p)] >= epoch(p)        // acquire: spin/notify on producer's flag
+       read p.addr ; compute
+```
+
+This is the **distributed analog of the tensormap fan-in / scheduler fan-out release** — but each consumer resolves its own fan-in via `deps()` and watches the producers' own flags, so there is **no central counter and no dispatcher**. It **recovers the overlap** barriers destroy: a core proceeds the instant *its* producers are done, independent of unrelated slow cores.
+
+- **Pros:** maximal overlap, no false coupling, scales with `N`.
+- **Cons:** many small sync events; correctness is delicate (release/acquire ordering, the #822 coherency trap if flags are read outside the snoop domain — §69); needs hardware notify/wait to avoid burning cores on spin-wait.
+
+### 67.4 Buffer reuse across iterations — epoch / version tagging (replacing the ring)
+
+The centralized model reclaimed transient buffers with the **scope ring** (monotone FIFO, §15). SPMD has no central allocator to advance a ring head, and a flag at a fixed slot would be ambiguous across iterations ("ready" from *which* pass?). The replacement is an **epoch counter per buffer slot**: a producer publishes `flag[slot] = epoch`; a consumer waits for `flag[slot] >= my_epoch`. Buffer **reuse** is then "the slot at this address now carries a higher epoch," and a producer wanting to overwrite a slot must first ensure all consumers of the *previous* epoch have read it — a **per-slot anti-dependence** expressed with a second (read-done) counter, or simply enforced by the enclosing super-step barrier (Regime A makes WAR hazards free because the barrier separates write-epochs). This is the SPMD form of the ring's "reclaim when `ref_count == fanout_count`" rule, **distributed** into per-slot epoch arithmetic.
+
+### 67.5 The hard case — data-dependent / irregular work (the systemic "hole")
+
+The §62 dynamic hole (MoE routing, variable token counts) is the stress point — but the work-stealing assignment of §67.1 **already solves the hard half of it**: once dynamic tasks exist, they are simply `push`ed onto deques and **balanced by competition**, exactly like static tasks, so **no leader is needed to balance irregular load**. What remains is narrower: the cores must **agree on what the dynamic tasks *are*** (their count and dependency structure), because each completing core computes consumers' fan-in via `deps()` and that must be globally consistent. Two pieces, in order:
+
+1. **Agree on the decision (barrier + broadcast).** Run the data-dependent step (e.g. routing) — redundantly on all cores, or on one — **publish the small decision tensor** (token→expert counts/permutation) to GM, **barrier once**, so every core now sees the same realized **symint** (the §61.2 bucketed `m_e`). After this single agreement the dependency structure is fixed and consistent, so `deps()`/`fanin_remaining` are well-defined again. Cost: one barrier + one small broadcast per hole — far cheaper than a global drain.
+2. **Generate + execute by competition (no leader for balance).** Whichever core(s) run the builder `submit_*`-inject the now-determined dynamic tasks onto the **shared work-stealing queues** (initializing their `fanin_remaining` from `deps()`); from there the ordinary competition of §67.1 dispatches and balances them across **all** cores. This is the §62 `ORCH` builder, but its output flows into the **distributed** queues rather than one scheduler's `ready_queue` — so the injection is centralized only for the instant of *building*, never for *executing*.
+
+A **leader-rank mini-orchestrator** is therefore an *option, not a necessity*: use it only when even the agreement step cannot be done redundantly (e.g. the routing decision is itself expensive and should run once), in which case one `rank` builds and the rest compete to drain — the SPMD analog of §61's static-region-with-a-hole. The recommended pattern mirrors §61: **work-stealing SPMD for all execution (regular *and* irregular), with a thin barrier-bounded *agreement* step for each data-dependent decision** — never a full central scheduler for the whole program.
+
+### 67.6 Why keep three regimes instead of picking one?
+
+A fair objection: three synchronization regimes (A barriers, B point-to-point flags, C async work-stealing) look like three subsystems' worth of complexity. Two answers dissolve most of it.
+
+**(1) They are not three subsystems — they are *one primitive at three widths*.** A barrier, a fan-in counter, and a point-to-point flag are all the **same operation: a threshold-wait on a monotone GM counter**, differing only in the threshold width:
+
+| Mechanism | Wait condition | = threshold-wait of width |
+|---|---|---|
+| point-to-point flag (B, special case) | producer posted its flag | **1** (one producer) |
+| fan-in counter (B) | `fanin_remaining == 0` | **k** (the task's producers) |
+| global barrier (A) | `arrival_count == N` | **N** (all cores) |
+
+So the runtime carries **one counter-wait primitive**, parameterized by width `{1, k, N}` — not three independent engines. The "complexity" is a compiler *choice of width per boundary*, not three code paths the system juggles.
+
+**(2) No single width is optimal everywhere — the best one is set by each boundary's dependency density.** Forcing one mode loses exactly what Part 6 exists to win:
+
+- **All-A (barriers everywhere).** Simplest, least hardware — but **catastrophically over-synchronizes at fine grain**: a global barrier at every tile boundary idles all `N` cores on the slowest, destroying the pipeline overlap that motivated removing the central dispatcher (§64). You decentralized to *scale*, then re-serialized on barriers. A is right only at **coarse (layer/phase)** boundaries.
+- **All-B (flags everywhere).** Maximal overlap — but (a) a **flag/notify storm** at fine grain makes sync traffic the new bottleneck; (b) at a **dense all-to-all** boundary (a layer that reads all of the previous layer), per-edge flags degenerate to an **`N²` flag mesh** that is structurally *worse* than **one** barrier; (c) correctness (release/acquire, epoch reuse, deadlock) is at its most delicate.
+- **You cannot eliminate A anyway.** The data-dependent agreement step (§67.5) *requires* a barrier, and fine-grained overlap *requires* B — so the minimal correct set already contains both.
+
+**The rule the compiler applies:** at each boundary pick the **coarsest still-correct** mechanism — sparse/local dependence ⇒ flags (a few waits, vs a barrier that idles on the slowest); dense all-to-all dependence ⇒ a barrier (`O(1)` structurally, vs an `N²` flag mesh). This is the ordinary "right sync granularity" judgment of any parallel program (GPU `__syncthreads()` vs fine-grained atomics; MPI barrier vs point-to-point) — no single granularity wins everywhere.
+
+**(3) The choice is the compiler's, not the programmer's.** The programmer marks only `pl.static` / `pl.dynamic` regions (§61.1); the compiler selects the regime per boundary from the **compile-time-known, topology-pure** dependency density (§66). So the three regimes are an *implementation menu the compiler picks from*, not three knobs the user balances. Collapsing to one mode would save a little compiler logic and forfeit the performance the whole Part targets.
+
+The **same logic governs the scheme-level hybrid** (§70): SPMD for the topology-pure bulk and the Part 5 scheduler / a leader for the irregular tail are not "two systems to maintain" but the **same `submit`/dependency machinery** lowered two ways, chosen per region by where the §64 ceiling actually bites. Unify the *mechanism* (one counter-wait primitive; one dependency relation as functions); specialize the *configuration* per boundary.
+
+### 67.7 How the compiler chooses the regime — the selection pass
+
+Regime selection is a **lowering pass over boundaries**, not a runtime decision. A *boundary* is an edge-set between a producer phase `P` and a consumer phase `C` (e.g. layer→layer, the K-loop stages of a GEMM, the tile edges inside a fused body). The pass runs once per boundary, on information the compiler **already has** from the topology-pure dependency analysis (the same analysis that produces the tensormap tags and `deps`/`fanout`, §66, §67.1.3).
+
+**Inputs the pass reads (all compile-time):**
+
+| Input | Source | Used to decide |
+|---|---|---|
+| edge count `\|E\|`, fan-in/out **degree** `k` (avg/max) | `deps`/`fanout` over the boundary | dense vs sparse |
+| **pattern class** (elementwise / stencil / tiled-GEMM / reduction / broadcast / all-to-all) | affine relation shape (§67.1.3) | recognizes idioms with known-best sync |
+| iteration-space **size** `\|P\|,\|C\|` (parametric over symints) | §60 template | `N²`-vs-`N` break-even |
+| **granularity / frequency** (how often the boundary recurs: per-layer vs per-tile) | loop nesting depth | barrier amortization |
+| **load variance** across tiles (uniform vs skewed) | tile cost model / shapes | barrier idle estimate |
+| **data-dependence** (is `k` bounded at compile time?) | topology-purity check (§61.3) | forces the §67.5 agreement path |
+| hierarchy placement (intra-group vs cross-chip) | `owner()` hint + Linqu level | barrier tier / steal radius (§69) |
+
+**The decision rule (a coarsest-still-correct cost comparison).** For each boundary the pass compares the two structural costs and picks the cheaper, with a bias toward the simpler (barrier) when they tie:
+
+```text
+  barrier_cost(e)  ≈  T_barrier(tier)            +  idle_on_slowest(load_variance)
+  flag_cost(e)     ≈  |E| · T_flag  (mostly overlapped)  +  bookkeeping(|E| flags/epochs)
+
+  choose A (barrier)  if  e is dense/all-to-all (|E| ≳ ρ·|P|·|C|)        # one wait beats N² flags
+                      or  e is coarse & load-balanced (rare, low variance) # idle negligible, simplest
+  choose B (flags)    if  e is sparse/local (small bounded k) and         # overlap matters,
+                          (fine-grained or load-skewed)                    # barrier would idle
+  choose §67.5 path   if  k is NOT bounded at compile time                # agreement barrier + then competition
+                      (one-shot barrier to fix the symint, then B + work-stealing on the realized sub-DAG)
+```
+
+The thresholds (`ρ`, the `T_barrier`/`T_flag` ratio) are **hardware constants** of a small machine model (barrier latency, flag post/wait latency, `N`), so the *same* IR retargets by re-running the pass with different constants — the break-even is not hard-coded.
+
+**Idiom shortcuts (before the general rule).** Recognized patterns bypass the cost model with a known-best choice: **elementwise / stencil / tiled-GEMM tile edges** → B (sparse, bounded `k`); **dense layer→layer activation** → A (all-to-all); **reduction / broadcast** → a **tree of staged point-to-point** waits (`O(log N)`), which is neither a flat `N²` mesh nor a full barrier; **the optimizer step / all-reduce** → the existing `atomic_add` accumulation (§25.2) gated by one phase barrier.
+
+**Algorithm (per region):**
+
+```text
+for each boundary e in topological order:
+    if not bounded_k(e):              emit AGREEMENT_BARRIER(e) ; continue   # §67.5
+    if idiom(e) is known:             emit idiom_choice(e)      ; continue
+    if dense(e) or (coarse(e) and balanced(e)):
+                                      emit BARRIER(e, tier=level(e))
+    else:                             emit FANIN_COUNTERS(e, width=max_k(e)) + flags
+# within any B-region, attach owner() as the steal/affinity hint (§67.1);
+# barriers are placed at the chosen tier (intra-group vs global, §69).
+```
+
+**Default, override, and profile-refine (mirrors §52/§56 phasing).**
+
+- **Default** is conservative and correct: when the cost model is uncertain, prefer **A at coarse boundaries** (always correct, simplest) and only drop to **B** where the pass is confident the boundary is sparse and fine — i.e. never *worse* than a clean BSP program, then improved where overlap clearly pays.
+- **Programmer override / hint.** `pl.sync(...)` (or an attribute on the region) can pin a boundary to `barrier` / `flags`, exactly as §61.1's `guards=`/`buckets=` refine capture — used when the static cost model misjudges a real workload.
+- **Profile-refined.** Because regions are captured/replayed (§50, §52), the **measured** per-boundary idle and sync traffic feed back to flip a regime on recapture (the §52 break-even, applied to sync granularity). So the static pass sets a good default; measurement tunes the residual — the choice is *compiler-owned* but *evidence-corrected*, never a runtime hot-path decision.
+
+In short: the compiler selects per boundary by a **degree/pattern-driven, hardware-parameterized, coarsest-still-correct cost comparison**, with idiom shortcuts, a safe BSP-default, an explicit override, and capture/replay measurement to refine — all using dependency facts it already computed, so selection adds a lowering pass, not new runtime machinery.
+
+## 68. Data Structures to Support the Scheme
+
+The SPMD model **deletes** the central structures (slot pool, `wiring/ready/completion` queues, the live tensormap, the central ring allocator) and **replaces** them with small, replicated, or distributed-lock-free structures. Side by side:
+
+| Centralized (`simpler` / Part 5) | SPMD (Part 6) | Notes |
+|---|---|---|
+| Live **tensormap** (tag→producer) | **`deps(l,t)` function** (replicated code) — fan-in view | recomputed per core; §66 |
+| Stored **`fanout_consumers` lists** + Phase-0 wiring (§62.4.1) | **`fanout(l,t)` function** (replicated code) — fan-out view | the reverse edge is *computed*, not stored; §67.1.2 |
+| Central **slot pool** + `fanin_count` | **`fanin_remaining[]` atomics in GM** (one per task slot index) | reserved once, init `=|deps(idx)|`; any completing core decrements (§67.1, §67.1.1) |
+| Central **`ready_queue`** (one writer = scheduler) | **per-core ready deques + steal protocol** (Chase–Lev) + shared overflow queue | distributed competition; local-first, steal-on-empty (§67.1) |
+| `wiring_queue`/`completion_queue` (cross-thread hand-off) | **completion-driven `atomic_dec` + `push` by the completing core** | every worker is also a scheduler; no hand-off agent |
+| **`owner(l,t)`** as a hard partition | **`owner(l,t)` kept only as a locality *hint*** (seed/steal bias) | competition overrides affinity (§67.1) |
+| **completion-flag / epoch array** in GM (per producible tile) | (still used for fine-grained ordering, Regime B) | §67.3; readiness can be expressed as flags *or* fan-in counters |
+| Central **ring allocator** (scope-indexed FIFO) | **replicated affine memory plan** `addr(l,t)` + **per-slot epoch counters** | §67.4; reuse = monotone epoch |
+| Scheduler **fan-out release** (one writer) | per-producer **`store_release flag=epoch`**; per-consumer **`wait flag>=epoch`** | distributed release/acquire |
+| `ORCH` builder task (§62) | **barrier object** + **broadcast buffer** for data-dependent decisions | §67.5 agreement step |
+| group-task completion gate | **arrival counter + sense-reversing barrier** | §69 hardware barrier |
+| (n/a) | **reduction buffers + GM atomics** (`atomic_add`) | grad accumulation / all-reduce land here unchanged from §25.2/§4.x |
+
+Concretely, the resident per-region metadata is:
+
+```text
+struct SpmdRegion {
+  IterationSpace iters;            // §60 template: loop bounds (L, T, ...) — replicated, read-only
+  AffinePlan     addr;             // base + l*layer_stride + t*tile_stride  — replicated, read-only
+  OwnerFn        owner;            // affine map — used only as a LOCALITY HINT — replicated, read-only
+  DepFn          deps;             // pure index→producer-set (fan-in view)  — replicated, read-only
+  FanoutFn       fanout;           // pure index→consumer-set (fan-out view) — replicated, read-only (§67.1.2)
+  // ── distributed work-stealing scheduler (the dynamic-competition core, §67.1) ──
+  atomic<u32>    fanin_remaining[NUM_TILES]; // GM; completing cores atomic_dec; 0 ⇒ ready
+  Deque          ready[N_CORES];   // per-core Chase–Lev ready deque (local push/pop, remote steal)
+  MPMCQueue      overflow;         // shared steal/overflow pool (fallback target)
+  // ── fine-grained ordering + reuse (§67.3–67.4) ──
+  Flag           flags[NUM_TILES]; // GM, distributed; flag = published epoch  — shared
+  Barrier        barriers[NUM_PHASES]; // arrival counters + sense             — shared
+  ScalarBcast    decisions[...];   // small data-dependent symints (§67.5)     — shared, write-once/phase
+};
+```
+
+Two properties keep this cheap: (1) everything except `fanin_remaining`, the `ready` deques, `overflow`, `flags`, `barriers`, and `decisions` is **read-only and replicated**, sitting in each core's local/const memory with no coherence traffic; (2) the shared mutable state is **monotone or local-first** — epoch counters only increase, barriers sense-reverse, and the deques are touched **locally** except for the rare steal — the friendliest pattern for lock-free GM access, matching the existing `atomic_add`/coherent-GM idioms (§25.2, §62.7). The central scheduler's **single `ready_queue` and cross-thread hand-off are gone**, replaced by `N` per-core deques that any worker drives as it completes its own tasks — so the serial dispatch section of §64 is dissolved, not relocated.
+
+## 69. Hardware Mechanisms Required for an Efficient Implementation
+
+SPMD trades a software scheduler for **hardware coordination primitives**. Its efficiency is *entirely* gated by how cheap these are; a software emulation of any of them reintroduces a serial section worse than the scheduler it replaced. Required, in rough priority:
+
+1. **A fast hardware barrier across all participating cores (and per-subgroup).** Regime A (§67.2) and the agreement step (§67.5) live or die on barrier latency. Need an **arrival/sense-reversal barrier** in hardware (or a single-instruction cross-core sync) with **hierarchical** support: an *intra-core-group* barrier (cheap, frequent) and an *inter-cluster/chip* barrier (rarer, slower) matching the Linqu tiers. On Ascend-class parts this is the role of the **FFTS / cross-core sync** fabric and hardware events; without a sub-microsecond barrier, BSP super-steps are dead.
+2. **Hardware producer→consumer signaling (notify/wait, doorbell/mailbox, `set_flag`/`wait_flag`).** Regime B (§67.3) issues huge volumes of point-to-point waits. A core must **block without busy-spinning** (to not waste a compute engine) and **wake on a remote post** with low latency. Hardware semaphore/notify arrays — not software spin loops — are mandatory; otherwise the sync cost dwarfs the compute it guards.
+3. **A coherent domain (or signaling that bypasses cache) for the flag/barrier state.** This is the **#822 hazard from §57 made systemic**: in SPMD, cross-core reads of flags happen *constantly*, so they **must** live where `store_release`/`acquire` are correct and cheap — inside the **AICPU↔AICore snoop domain** for software flags, *or* on a **dedicated hardware sync path** that is coherent by construction (FFTS events, hardware semaphores). A flag published outside the snoop domain dead-spins exactly as #822 documents. This single constraint is why SPMD must run on cores within **one coherency fabric**, and why scaling beyond it needs the hierarchical tier (3) with explicit `cache_invalidate_range` only at the **coarse** (per-super-step) boundary, never per flag.
+4. **GM atomics (CAS, `atomic_add`, `fetch_add`, double-word CAS) — now first-class, because assignment is dynamic competition (§67.1).** They back the **distributed work-stealing scheduler**: `atomic_dec` of `fanin_remaining`, the Chase–Lev deque's `push/pop/steal` (which need a double-word or LL/SC CAS on the deque's top/bottom indices), the shared overflow MPMC queue, plus barrier arrival counters and gradient/all-reduce accumulation (§25.2). These must be **device-local and contention-tolerant** (combining / exponential back-off / per-core sharding), since under heavy stealing they are the only cross-core hot path. The local-first deque design keeps the common case **uncontended** (a core hits its own deque), so atomic pressure scales with *imbalance*, not with task count — but the hardware must still make a steal **cheap** (single-digit-µs CAS) or stealing stops paying for itself.
+5. **DMA with completion semaphores.** Data movement (tile stores, cross-core/cross-chip transfers) should **post completion directly to a waiter's flag**, so the producer→consumer release rides the copy engine rather than requiring a separate core round-trip.
+6. **A persistent-kernel launch model + enough per-core scalar/program capacity.** Cores must stay **resident** for the whole region (launched once, looping over the schedule) rather than being relaunched per tile — otherwise the launch path is the new central bottleneck. This demands that the compute core's **scalar/control pipeline** can hold and run the orchestration control flow (the iteration loop, `owner`/`deps` arithmetic, the wait/post sequences). This is a genuine architectural ask: AIC/AIV are SIMD cube/vector engines with a *thin* scalar unit; running full orchestration on them needs adequate scalar I-cache/program memory and branch capability, or a **co-resident scalar companion per core-group** that drives a small cluster of compute engines (a middle ground between "every AIC orchestrates" and "one AICPU orchestrates all").
+7. **A uniform/scalar broadcast path.** For §67.5, the small data-dependent decision (routing counts, a realized symint) must reach all cores cheaply — a hardware broadcast/multicast or a one-to-many notify, so the agreement step is `O(log N)` or `O(1)`, not `O(N)`.
+8. **Deterministic, low-skew core clocks / progress** (soft requirement). Barrier idle is bounded by the **slowest** core; large clock/thermal skew inflates super-step cost. Helps to have balanced cores and tight DVFS.
+
+**The architectural punchline:** the central scheduler's cost (`O(#tasks)` on one AICPU) is converted into **hardware-fabric cost** (`O(#sync events)` on a barrier/semaphore network) plus **`O(#tasks/N)` redundant index arithmetic per core**. SPMD wins **iff** the hardware sync fabric is fast and coherent enough that the sync events are cheaper than the dispatches they replace — which is precisely why the mechanisms above are not optional niceties but the **enabling substrate**.
+
+## 70. Where SPMD Fits — and the Hybrid Recommendation
+
+SPMD is **not** a wholesale replacement for the centralized model, but with **dynamic-competition assignment** (§67.1) its reach is wider than a static-partition scheme: it is the natural engine for the **topology-pure bulk** that dominates training/inference flops — dense GEMMs, attention, transformer FFNs, the optimizer step, fixed-micro-batch loops — *and*, because work-stealing balances any ready work, it also handles **irregular execution** (uneven MoE experts, ragged batches) gracefully. The one thing it cannot do unaided is **resolve a data-dependent topology**: when the very *shape* of the dependency graph depends on runtime data, the cores need a one-shot agreement (§67.5) before competition can resume.
+
+The recommendation is therefore the **same static/dynamic decomposition as §61, with the static engine swapped from "one device scheduler" to "SPMD cooperative execution":**
+
+- **Bulk (topology-pure regions) → SPMD persistent cores with work-stealing.** Reuse the §60 template directly; **cores compete for ready work** (per-core deques + steal, §67.1) with `owner()` as a locality hint; order by hierarchical barriers (Regime A) at layer/phase boundaries, refined with point-to-point flags / fan-in counters (Regime B) inside regular phases.
+- **Irregular topology → a barrier-bounded agreement step (§67.5 step 1)** to fix the realized graph, after which the dynamically-generated tasks are injected into the **same work-stealing queues** and balanced by competition (no leader needed for balance); a **leader-rank builder** (§67.5) is reserved only for when the *decision itself* must run once. This keeps a centralized scheduler off the critical path entirely.
+- **DSL surface is unchanged in spirit.** `with pl.static(...)` now means "compile this region into the SPMD megakernel slice for each rank" instead of "capture a frozen `Task[]` for one scheduler"; `with pl.dynamic()` marks the agreement/leader region. The programmer-facing boundary (§61.1) and topology-key guards (§53) carry over verbatim — Part 6 is a **different lowering of the same scoped regions**, not a new front end.
+
+This makes Part 6 **composable with Part 5**: a deployment can run the static regions via host-build/device-scheduler (Part 5) *or* via SPMD megakernel (Part 6), choosing per region by which the hardware sync fabric favors — large `N`, tiny tiles, regular topology ⇒ SPMD; modest `N`, irregular topology, or weak sync hardware ⇒ the Part 5 scheduler.
+
+## 71. Comparison: Simpler Runtime vs. Part 5 Enhancement vs. SPMD
+
+### 71.1 Three-way feature comparison
+
+| Dimension | **A. `simpler` runtime** (Parts 1–4: centralized, define-by-run) | **B. Part 5 enhancement** (§57–§63: host-build-once / device-execute + `ORCH` holes) | **C. SPMD every-core** (Part 6: persistent megakernel + worker identity) |
+|---|---|---|---|
+| **Central bottleneck** | **Yes** — orchestrator builds every step *and* one scheduler dispatches every task | **Reduced but present** — builder amortized/host-offloaded, but **one device scheduler** still dispatches `O(#tasks)` | **None** — no dispatcher; each core runs its own slice |
+| **Per-step orchestration cost** | Highest: full tag-walk + ring alloc + wiring every step (§46) | Near-zero builder (replay); dispatcher loop remains | Zero central; `O(#tasks/N)` redundant index arithmetic per core |
+| **Dispatch scalability with N cores** | Poor — starves once `N > t/d` (§64) | Same ceiling (one scheduler loop) | **Best** — no Amdahl serial section; scales with fabric |
+| **Load balancing** | **Dynamic** (scheduler feeds next free worker) — excellent | **Dynamic** — excellent | **Dynamic** via **distributed work-stealing** (§67.1) — cores compete for ready work, no central agent; `owner()` is only a locality hint. (Pure barrier/Regime-A phases still idle on the slowest core; flag/steal phases do not) |
+| **Dynamic control flow** | **Native** (eager define-by-run) | Native via eager `pl.dynamic` holes (§61.7) | **Per-core divergence is free; irregular *execution* is balanced by work-stealing.** Only a **data-dependent *topology*** is hard — needs a one-shot barrier+broadcast agreement (§67.5); after that, competition runs it |
+| **Branch divergence / execution model** | MIMD (each core/agent independent) | MIMD | **MIMD — independent PC per core; no SIMT warp, no lane masking, no divergence penalty** (§65.2); contrast GPU SIMT's shared-PC lock-step |
+| **Synchronization** | In-domain atomics, queue hand-off (cheap, central) | Same; one-shot host→device copy + 1× invalidate per region (§58) | Distributed barriers + per-tile flags; **demands fast coherent HW sync** (§69) |
+| **Memory footprint** | Live tensormap + slot pool + ring (modest, transient) | Frozen `Task[]`; **templated** keeps it MB-scale (§60); GB risk if unrolled (§59) | **Smallest shared state** — replicated read-only plan + flag/epoch array; no slot pool/queues |
+| **Coherency / HW requirements** | Lowest (all on one coherent AICPU) | One-shot copy must respect #822; otherwise modest | **Highest** — fast hierarchical barrier, HW notify/wait, coherent flags, persistent kernels, scalar capacity on compute cores (§69) |
+| **Programming / correctness complexity** | Low (define-by-run; deps inferred) | Medium (capture/replay, guards, hole spawn/join §62.4.3) | **High** — distributed races, epoch/version mgmt, deadlock, barrier discipline |
+| **Determinism** | Deterministic deps; dispatch order varies | Frozen → highly deterministic | **Deterministic results** (all `deps` respected); **execution order is nondeterministic** by design (work-stealing) — same as the simpler runtime's varying dispatch |
+| **Reuse of existing `simpler` machinery** | — (is the baseline) | **High** — `dep_gen`, `host_build_graph`, `prepared_callable`, same scheduler/worker (§48) | **Low** — reuses the §60 template + `atomic_add`, but replaces scheduler/tensormap/ring with new sync substrate |
+| **Best-fit workload** | Small/irregular, prototyping, max flexibility | Repetitive regions, decode, training steps; modest-to-large `N` | Topology-pure bulk *and* irregular-load (work-stealing) at **very large `N`**, given a fast coherent sync fabric; weakest only when the *topology itself* is data-dependent |
+| **Maturity / risk** | Shipped | Incremental on shipped code | **Most speculative**; needs HW support to pay off |
+
+### 71.2 SPMD scheme — focused pros / cons
+
+| Pros | Cons |
+|---|---|
+| **Removes the central dispatcher** — the §64 Amdahl ceiling disappears; throughput scales with core count, not with one AICPU | **Atomic/deque contention under heavy stealing**, and **nondeterministic execution order** (results stay deterministic); a *pure barrier* phase still idles on the slowest core |
+| **Dynamic load balancing *without* a central agent** — work-stealing (§67.1) lets cores compete for ready work; the scheduler is *distributed* across all workers, not deleted, so irregular/ragged load self-balances | **A data-dependent *topology* still needs a one-shot agreement** (barrier+broadcast, §67.5) before competition can resume — the only residual centralization |
+| **No scarce-AICPU dependence** — orchestration is folded into the compute cores; frees the contended AICPU cluster entirely | **Bounded to one coherency/snoop domain** — work-stealing atomics, flags, and barriers are cheap only inside one fabric; scaling across chips needs a hierarchical tier (intra-group fast, cross-chip coarse, §69) and steals/flags get expensive past the boundary |
+| **No SIMT divergence penalty — independent PC per core (true MIMD)** — unlike a GPU warp's shared PC + lane masking, cores take different branches at zero relative cost, so heterogeneous per-core roles/pipelines are first-class (§65.2) | **Heterogeneous, asynchronous behavior** is the flip side — per-core control flow makes correctness, deadlock-freedom, and debugging far harder than one inspectable scheduler |
+| **Smallest shared state** — read-only replicated plan + a monotone flag/epoch array; no slot pool, queues, or central mutex | **Correctness is hard** — distributed release/acquire, epoch/version reuse, deadlock and WAR/RAW hazards are the programmer's/compiler's burden |
+| **Maximal overlap with point-to-point flags** — a core advances the instant *its* producers finish, with no false coupling | **Hardware-gated** — useless without a fast, coherent barrier + notify/wait fabric; software emulation is worse than the scheduler it replaces (§69, #822) |
+| **Natural endpoint of Part 5** — reuses the §60 template/iteration-space verbatim; same `pl.static`/`pl.dynamic` scopes, different lowering | **Compute cores must run control flow** — needs scalar/program capacity on AIC/AIV (or a per-group scalar companion); they are thin SIMD engines today |
+| **Lowest steady-state coordination cost** — `O(#tasks/N)` parallel index arithmetic vs `O(#tasks)` serial dispatch | **Redundant schedule computation** on every core; **debuggability/observability** is far worse than a single inspectable scheduler |
+| **Composable** — apply SPMD per-region where it wins; fall back to the Part 5 scheduler elsewhere | **Most speculative / highest engineering risk**; new sync runtime, new failure modes, hardest to validate |
+
+### 71.3 Bottom line
+
+The progression A → B → C is a steady **decentralization of orchestration**: A builds and dispatches centrally every step; B freezes the build and offloads it, but still dispatches centrally; C removes the dispatcher altogether by making **every worker also a scheduler** — cores compete for ready work (work-stealing, §67.1) and synchronize peer-to-peer. The key refinement over a naïve static-partition SPMD is that **C keeps the central scheduler's dynamic load balancing** by *distributing* it, rather than trading it away: it is the **only** design that escapes the single-agent throughput ceiling of §64 *while* preserving dynamic balance. What it genuinely **converts** is a software-scheduling problem into a **hardware-synchronization problem** — fast barriers, notify/wait, coherent flags, and cheap GM atomics for the deques — realizable **only if that fabric is fast and within one snoop domain**, and at the cost of **harder correctness** (distributed races, deadlock-freedom) and a **residual one-shot agreement** for data-dependent topologies. The pragmatic path is **hybrid**: keep the §61 static/dynamic decomposition, lower **topology-pure regions to work-stealing SPMD** (where `N` is large, tiles are small, and the §64 ceiling actually bites), and use a **barrier-bounded agreement step (then competition) for the data-dependent tail** — so the centralized dispatcher is removed from the hot path while dynamic balancing and dynamic control flow are both retained.
+
